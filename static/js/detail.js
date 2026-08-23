@@ -87,8 +87,7 @@ function renderDetailPanel(d) {
         </select>
         <label>担当者</label>
         <select id="dp-assignee" ${dis('assignee_id')}>
-          <option value="">未割当</option>
-          ${State.members.map(m => `<option value="${m.id}" ${m.id === t.assignee_id ? 'selected' : ''}>${U.esc(m.name)}</option>`).join('')}
+          ${assigneeOptionsHtml(t)}
         </select>
         ${fieldVisible('priority') ? `<label>優先度</label>
         <select id="dp-priority" ${dis('priority')}>
@@ -282,8 +281,7 @@ function bindDetailEvents(t, d) {
 
   $('dp-title').onchange = (e) => patchTask(tid, { title: e.target.value }, { silent: true });
   $('dp-status').onchange = (e) => patchTask(tid, { status_id: Number(e.target.value) });
-  $('dp-assignee').onchange = (e) =>
-    patchTask(tid, { assignee_id: e.target.value ? Number(e.target.value) : null });
+  $('dp-assignee').onchange = (e) => patchTask(tid, assigneePatch(e.target.value));
   if ($('dp-priority')) $('dp-priority').onchange = (e) => patchTask(tid, { priority: e.target.value });
   $('dp-milestone').onchange = (e) => patchTask(tid, { milestone: e.target.checked });
   $('dp-start').onchange = (e) => patchTask(tid, { start_date: e.target.value || null });

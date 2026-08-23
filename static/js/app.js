@@ -85,6 +85,36 @@ function canEditNotes() {
 function canSchedule() { return State.myRole === 'admin'; }
 function fieldVisible(key) { return pset('show_' + key) !== false; }
 
+/* ---------------- 仮想担当（メンバー以外の担当者選択肢。PJ設定で定義） ---------------- */
+function virtualAssignees() { return pset('virtual_assignees') || []; }
+function assigneeName(t) {
+  const m = memberMap()[t.assignee_id];
+  return m ? m.name : (t.assignee_label || null);
+}
+function virtualAvatarHtml(label, extra = '') {
+  return `<span class="avatar va ${extra}" title="${U.esc(label)}（仮想担当）">${U.esc(label.slice(0, 2))}</span>`;
+}
+function taskAvatarHtml(t, extra = '') {
+  if (t.assignee_id) return U.avatarHtml(memberMap()[t.assignee_id], extra);
+  if (t.assignee_label) return virtualAvatarHtml(t.assignee_label, extra);
+  return U.avatarHtml(null, extra);
+}
+/* 担当者セレクトの共通options（実メンバー＋仮想担当）。仮想は "v:ラベル" 値 */
+function assigneeOptionsHtml(t) {
+  const va = virtualAssignees();
+  return `<option value="">未割当</option>` +
+    State.members.map(m =>
+      `<option value="${m.id}" ${t && m.id === t.assignee_id ? 'selected' : ''}>${U.esc(m.name)}</option>`).join('') +
+    (va.length ? `<optgroup label="── メンバー以外">` + va.map(l =>
+      `<option value="v:${U.esc(l)}" ${t && !t.assignee_id && t.assignee_label === l ? 'selected' : ''}>${U.esc(l)}</option>`).join('') + '</optgroup>' : '');
+}
+/* セレクト値 → PATCH内容 */
+function assigneePatch(value) {
+  if (value === '') return { assignee_id: null, assignee_label: null };
+  if (value.startsWith('v:')) return { assignee_id: null, assignee_label: value.slice(2) };
+  return { assignee_id: Number(value), assignee_label: null };
+}
+
 function filteredTasks() {
   const f = State.filters;
   const smap = statusMap();
@@ -93,8 +123,10 @@ function filteredTasks() {
     if (kw && !(t.title.toLowerCase().includes(kw) ||
                 (t.description || '').toLowerCase().includes(kw) ||
                 t.tags.some(tg => tg.toLowerCase().includes(kw)))) return false;
-    if (f.assignee === 'none' && t.assignee_id) return false;
-    if (f.assignee && f.assignee !== 'none' && t.assignee_id !== Number(f.assignee)) return false;
+    if (f.assignee === 'none' && (t.assignee_id || t.assignee_label)) return false;
+    if (f.assignee && f.assignee.startsWith('v:') && t.assignee_label !== f.assignee.slice(2)) return false;
+    if (f.assignee && f.assignee !== 'none' && !f.assignee.startsWith('v:') &&
+        t.assignee_id !== Number(f.assignee)) return false;
     if (f.priority && t.priority !== f.priority) return false;
     if (f.tag && !t.tags.includes(f.tag)) return false;
     if (f.hideDone && smap[t.status_id] && smap[t.status_id].is_done) return false;
@@ -640,7 +672,8 @@ function renderFilterOptions() {
   const fa = document.getElementById('f-assignee');
   const cur = State.filters.assignee;
   fa.innerHTML = `<option value="">担当者: 全員</option><option value="none">未割当</option>` +
-    State.members.map(m => `<option value="${m.id}">${U.esc(m.name)}</option>`).join('');
+    State.members.map(m => `<option value="${m.id}">${U.esc(m.name)}</option>`).join('') +
+    virtualAssignees().map(l => `<option value="v:${U.esc(l)}">${U.esc(l)}</option>`).join('');
   fa.value = cur;
 
   const ft = document.getElementById('f-tag');
@@ -664,8 +697,7 @@ function openTaskModal(preset = {}) {
         <select id="nt-status">${State.statuses.map(s =>
           `<option value="${s.id}" ${s.id === preset.status_id ? 'selected' : ''}>${U.esc(s.name)}</option>`).join('')}</select></div>
       <div class="form-row"><label>担当者</label>
-        <select id="nt-assignee"><option value="">未割当</option>${State.members.map(m =>
-          `<option value="${m.id}" ${m.id === preset.assignee_id ? 'selected' : ''}>${U.esc(m.name)}</option>`).join('')}</select></div>
+        <select id="nt-assignee">${assigneeOptionsHtml({ assignee_id: preset.assignee_id || null, assignee_label: null })}</select></div>
       <div class="form-row"><label>優先度</label>
         <select id="nt-priority">
           <option value="highest">最優先</option><option value="high">高</option>
@@ -693,7 +725,7 @@ function openTaskModal(preset = {}) {
         title,
         description: v('nt-desc'),
         status_id: Number(v('nt-status')),
-        assignee_id: v('nt-assignee') ? Number(v('nt-assignee')) : null,
+        ...assigneePatch(v('nt-assignee')),
         priority: v('nt-priority'),
         parent_id: v('nt-parent') ? Number(v('nt-parent')) : null,
         start_date: v('nt-start') || null,

@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     description TEXT DEFAULT '',
     status_id INTEGER REFERENCES statuses(id) ON DELETE SET NULL,
     assignee_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+    assignee_label TEXT,                   -- 仮想担当（メンバー外の選択肢。例: 顧客）
     priority TEXT DEFAULT 'medium',        -- highest/high/medium/low
     start_date TEXT, due_date TEXT,
     progress INTEGER DEFAULT 0,
@@ -285,6 +286,8 @@ DEFAULT_PROJECT_SETTINGS = {
     "external_default_view_comments": False,
     "external_default_view_detail": False,
     "external_can_export": False,
+    # --- 担当者の追加選択肢（アサイン済みメンバー以外。例: 顧客・ベンダーA） ---
+    "virtual_assignees": [],
     # --- 通知（Teams/Slack Incoming Webhook） ---
     "webhook_url": "",
     "webhook_events": ["mention", "assign", "due"],   # mention/assign/due/status/comment
@@ -320,6 +323,8 @@ def migrate(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE tasks ADD COLUMN deleted_at TEXT")       # ゴミ箱（論理削除）
     if "recur" not in t_cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN recur TEXT DEFAULT ''")  # 繰り返し: weekly/biweekly/monthly
+    if "assignee_label" not in t_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN assignee_label TEXT")    # 仮想担当
     n_cols = {r["name"] for r in conn.execute("PRAGMA table_info(project_notes)")}
     if "deleted_at" not in n_cols:
         conn.execute("ALTER TABLE project_notes ADD COLUMN deleted_at TEXT")
@@ -527,6 +532,7 @@ class TaskIn(BaseModel):
     status_id: Optional[int] = None
     assignee_id: Optional[int] = None
     priority: str = "medium"
+    assignee_label: Optional[str] = None
     start_date: Optional[str] = None
     due_date: Optional[str] = None
     progress: int = 0
@@ -547,6 +553,7 @@ class TaskPatch(BaseModel):
     description: Optional[str] = None
     status_id: Optional[int] = None
     assignee_id: Optional[int] = None
+    assignee_label: Optional[str] = None
     priority: Optional[str] = None
     start_date: Optional[str] = None
     due_date: Optional[str] = None
@@ -1585,10 +1592,12 @@ def create_task(pid: int, t: TaskIn):
             status_id = first["id"] if first else None
         cur = conn.execute(
             "INSERT INTO tasks(project_id, parent_id, title, description, status_id,"
-            " assignee_id, priority, start_date, due_date, progress, estimate_h, actual_h,"
+            " assignee_id, assignee_label, priority, start_date, due_date, progress,"
+            " estimate_h, actual_h,"
             " milestone, tags, deps, custom_values, recur, sort_order, created_at, updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (pid, t.parent_id, t.title, t.description, status_id, t.assignee_id,
+             t.assignee_label,
              t.priority, t.start_date, t.due_date, t.progress, t.estimate_h, t.actual_h,
              int(t.milestone), json.dumps(t.tags, ensure_ascii=False),
              json.dumps(t.deps), json.dumps(t.custom_values, ensure_ascii=False),
@@ -1658,8 +1667,13 @@ def update_task(tid: int, patch: TaskPatch):
                             f"{names.get(old['status_id'], '—')} → {names.get(data['status_id'], '—')}")
         if "assignee_id" in data and data["assignee_id"] != old["assignee_id"]:
             names = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM members")}
+            old_disp = names.get(old["assignee_id"]) or old.get("assignee_label") or "未割当"
+            new_disp = names.get(data["assignee_id"]) or data.get("assignee_label") or "未割当"
             record_activity(conn, old["project_id"], tid, actor_id, "assignee",
-                            f"{names.get(old['assignee_id'], '未割当')} → {names.get(data['assignee_id'], '未割当')}")
+                            f"{old_disp} → {new_disp}")
+        elif "assignee_label" in data and data["assignee_label"] != old.get("assignee_label"):
+            record_activity(conn, old["project_id"], tid, actor_id, "assignee",
+                            f"{old.get('assignee_label') or '未割当'} → {data['assignee_label'] or '未割当'}")
         if "progress" in data and data["progress"] != old["progress"]:
             record_activity(conn, old["project_id"], tid, actor_id, "progress",
                             f"{old['progress']}% → {data['progress']}%")
@@ -1967,7 +1981,7 @@ def export_csv(pid: int):
     w.writerow(headers)
     for t in build_wbs_rows(d["tasks"]):
         row = [t["wbs"], t["id"], ("　" * t["depth"]) + t["title"],
-               smap.get(t["status_id"], ""), mmap.get(t["assignee_id"], ""),
+               smap.get(t["status_id"], ""), mmap.get(t["assignee_id"]) or t.get("assignee_label") or "",
                PRIORITY_LABEL.get(t["priority"], t["priority"]),
                t["start_date"] or "", t["due_date"] or "", t["progress"],
                t["estimate_h"] or "", t["actual_h"] or "",
@@ -2046,7 +2060,7 @@ def export_xlsx(pid: int):
     for t in wbs_rows:
         row = [t["wbs"], t["id"], ("　" * t["depth"]) + t["title"],
                smap.get(t["status_id"], {}).get("name", ""),
-               mmap.get(t["assignee_id"], ""),
+               mmap.get(t["assignee_id"]) or t.get("assignee_label") or "",
                PRIORITY_LABEL.get(t["priority"], t["priority"]),
                t["start_date"] or "", t["due_date"] or "", t["progress"],
                t["estimate_h"], t["actual_h"], "○" if t["milestone"] else "",
@@ -2124,7 +2138,7 @@ def export_html(pid: int):
     for s in d["statuses"]:
         cards = "".join(
             f'<div class="card"><b>{esc(t["title"])}</b>'
-            f'<span>{esc(mmap.get(t["assignee_id"], "未割当"))} / '
+            f'<span>{esc(mmap.get(t["assignee_id"]) or t.get("assignee_label") or "未割当")} / '
             f'期限 {esc(t["due_date"] or "-")}</span></div>'
             for t in d["tasks"] if t["status_id"] == s["id"])
         kanban_cols += (
@@ -2141,7 +2155,7 @@ def export_html(pid: int):
             f'{" ◆" if t["milestone"] else ""}</td>'
             f'<td><span class="badge" style="background:{esc(st.get("color", "#999"))}">'
             f'{esc(st.get("name", "-"))}</span></td>'
-            f'<td>{esc(mmap.get(t["assignee_id"], "未割当"))}</td>'
+            f'<td>{esc(mmap.get(t["assignee_id"]) or t.get("assignee_label") or "未割当")}</td>'
             f'<td>{esc(PRIORITY_LABEL.get(t["priority"], t["priority"]))}</td>'
             f'<td>{esc(t["start_date"] or "-")}</td><td>{esc(t["due_date"] or "-")}</td>'
             f'<td><div class="pbar"><div style="width:{t["progress"]}%"></div></div>'
@@ -2292,7 +2306,7 @@ def ai_context(project_id: Optional[int] = None):
             "wbs": t["wbs"], "id": t["id"], "title": t["title"],
             "status": smap.get(t["status_id"], {}).get("name"),
             "done": bool(smap.get(t["status_id"], {}).get("is_done")),
-            "assignee": mmap.get(t["assignee_id"]),
+            "assignee": mmap.get(t["assignee_id"]) or t.get("assignee_label"),
             "priority": t["priority"], "start": t["start_date"], "due": t["due_date"],
             "progress": t["progress"], "milestone": t["milestone"],
             "parent_id": t["parent_id"], "deps": t["deps"],
@@ -2914,20 +2928,21 @@ def project_metrics(pid: int):
         # 工数: 担当者別 見積/実績
         effort = {}
         for t in tasks:
-            key = t["assignee_id"] or 0
+            key = t["assignee_id"] or t.get("assignee_label") or 0
             e = effort.setdefault(key, {"estimate": 0, "actual": 0, "tasks": 0})
             e["estimate"] += t["estimate_h"] or 0
             e["actual"] += t["actual_h"] or 0
             e["tasks"] += 1
         mmap = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM members")}
-        effort_rows = [{"assignee": mmap.get(k, "未割当"), **v}
+        effort_rows = [{"assignee": (mmap.get(k) if isinstance(k, int) else k) or "未割当", **v}
                        for k, v in effort.items()]
         # リスク: 期限3日以内で進捗50%未満、または期限超過（未完了）
         ts = today.isoformat()
         soon = (today + timedelta(days=3)).isoformat()
         risks = [
             {"id": t["id"], "title": t["title"], "due": t["due_date"],
-             "progress": t["progress"], "assignee": mmap.get(t["assignee_id"]),
+             "progress": t["progress"],
+             "assignee": mmap.get(t["assignee_id"]) or t.get("assignee_label"),
              "overdue": t["due_date"] < ts}
             for t in tasks
             if t["due_date"] and t["status_id"] not in done_ids

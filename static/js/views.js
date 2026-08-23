@@ -49,10 +49,15 @@ function renderBoard(container) {
         head: `${U.avatarHtml(m)}${U.esc(m.name)}`,
         tasks: tasks.filter(t => t.assignee_id === m.id),
       })),
+      ...virtualAssignees().map(l => ({
+        key: `v:${l}`, id: null, name: l, color: '#64748b',
+        head: `${virtualAvatarHtml(l)}${U.esc(l)}`,
+        tasks: tasks.filter(t => !t.assignee_id && t.assignee_label === l),
+      })),
       {
         key: 'm-none', id: null, name: '未割当', color: '#94a3b8',
         head: `${U.avatarHtml(null)}未割当`,
-        tasks: tasks.filter(t => !t.assignee_id),
+        tasks: tasks.filter(t => !t.assignee_id && !t.assignee_label),
       },
     ];
   }
@@ -79,7 +84,7 @@ function renderBoard(container) {
       const key = btn.dataset.col;
       const preset = {};
       if (key.startsWith('s')) preset.status_id = Number(key.slice(1));
-      else if (key !== 'm-none') preset.assignee_id = Number(key.slice(1));
+      else if (key.startsWith('m') && key !== 'm-none') preset.assignee_id = Number(key.slice(1));
       openTaskModal(preset);
     });
   });
@@ -107,7 +112,7 @@ function cardHtml(t, smap, byStatus) {
         ${hasChildren(t.id) ? `⧉ ${State.tasks.filter(x => x.parent_id === t.id).length}` : ''}
       </span>
       <span class="spacer"></span>
-      ${U.avatarHtml(m)}
+      ${taskAvatarHtml(t)}
     </div>
   </div>`;
 }
@@ -146,10 +151,17 @@ function setupBoardDnD(container, byStatus) {
           if (st && st.is_done) patch.progress = 100;   // 完了列へ移動したら進捗100%
           await API.updateTask(dragId, patch);
           toast(`「${t.title}」→ ${st ? st.name : ''}`);
+        } else if (key.startsWith('v:')) {
+          const label = key.slice(2);
+          if (!t.assignee_id && t.assignee_label === label) return;
+          await API.updateTask(dragId, { assignee_id: null, assignee_label: label,
+                                         actor_id: State.currentUserId });
+          toast(`「${t.title}」の担当 → ${label}`);
         } else {
           const mid = key === 'm-none' ? null : Number(key.slice(1));
-          if (t.assignee_id === mid) return;
-          await API.updateTask(dragId, { assignee_id: mid, actor_id: State.currentUserId });
+          if (t.assignee_id === mid && !t.assignee_label) return;
+          await API.updateTask(dragId, { assignee_id: mid, assignee_label: null,
+                                         actor_id: State.currentUserId });
           const m = memberMap()[mid];
           toast(`「${t.title}」の担当 → ${m ? m.name : '未割当'}`);
         }
@@ -175,7 +187,7 @@ function renderTable(container) {
       switch (key) {
         case 'title': return t.title;
         case 'status': return smap[t.status_id] ? smap[t.status_id].sort_order : 99;
-        case 'assignee': return mmap[t.assignee_id] ? mmap[t.assignee_id].name : 'んんん';
+        case 'assignee': return assigneeName(t) || 'んんん';
         case 'priority': return { highest: 0, high: 1, medium: 2, low: 3 }[t.priority] ?? 9;
         case 'start_date': return t.start_date || '9999';
         case 'due_date': return t.due_date || '9999';
@@ -289,12 +301,18 @@ function renderTable(container) {
       const tid = Number(el.closest('tr').dataset.id);
       const field = el.dataset.edit;
       let value = el.value === '' ? null : el.value;
-      if (field === 'progress' || field === 'status_id' || field === 'assignee_id') {
-        value = value === null ? null : Number(value);
+      let patchBody;
+      if (field === 'assignee_id') {
+        patchBody = assigneePatch(el.value);
+      } else {
+        if (field === 'progress' || field === 'status_id') {
+          value = value === null ? null : Number(value);
+        }
+        if (field === 'estimate_h') value = value === null ? null : Number(value);
+        patchBody = { [field]: value };
       }
-      if (field === 'estimate_h') value = value === null ? null : Number(value);
       try {
-        await API.updateTask(tid, { [field]: value, actor_id: State.currentUserId });
+        await API.updateTask(tid, { ...patchBody, actor_id: State.currentUserId });
         await refresh();
       } catch (err) { toast('更新に失敗: ' + err.message); }
     });
@@ -314,8 +332,7 @@ function tableRowHtml(t, smap, mmap, cfDefs, vis, bulk) {
       ${State.statuses.map(s => `<option value="${s.id}" ${s.id === t.status_id ? 'selected' : ''}>${U.esc(s.name)}</option>`).join('')}
     </select></td>
     <td><select data-edit="assignee_id" ${dis('assignee_id')}>
-      <option value="">未割当</option>
-      ${State.members.map(m => `<option value="${m.id}" ${m.id === t.assignee_id ? 'selected' : ''}>${U.esc(m.name)}</option>`).join('')}
+      ${assigneeOptionsHtml(t)}
     </select></td>
     ${vis.prio ? `<td><select data-edit="priority" ${dis('priority')}>
       ${['highest', 'high', 'medium', 'low'].map(p => `<option value="${p}" ${p === t.priority ? 'selected' : ''}>${U.prioLabel[p]}</option>`).join('')}
@@ -423,7 +440,7 @@ function renderGantt(container) {
   const leftRows = rows.map(t => {
     const kids = hasChildren(t.id);
     const isCollapsed = collapsed.has(t.id);
-    const m = mmap[t.assignee_id];
+    const aname = assigneeName(t);
     return `<div class="g-row ${G.edit ? 'g-editable-row' : ''}" data-row="${t.id}" ${G.edit ? 'draggable="true"' : ''}>
       <span class="g-wbs">${G.edit ? '<span class="g-grip" title="ドラッグで並べ替え">⠿</span>' : ''}${U.esc(t.wbs)}</span>
       <div class="g-cell-name" style="width:${G.nameW}px;min-width:${G.nameW}px;padding-left:${8 + t.depth * 14}px">
@@ -435,7 +452,7 @@ function renderGantt(container) {
           <button class="g-tool" data-outdent="${t.id}" title="1階層上げる">⭠</button>
         </span>` : ''}
       </div>
-      <span class="g-cell-sm g-col-a" title="${m ? U.esc(m.name) : ''}">${m ? U.esc(m.name.split(/[\s　]/)[0]) : '—'}</span>
+      <span class="g-cell-sm g-col-a" title="${aname ? U.esc(aname) : ''}">${aname ? U.esc(aname.split(/[\s　]/)[0]) : '—'}</span>
       <span class="g-cell-sm g-col-d">${fmtShort(t.start_date)}${(t.start_date || t.due_date) ? '〜' : ''}${fmtShort(t.due_date)}</span>
       <span class="g-cell-sm g-col-p">${t.progress}%</span>
     </div>`;
@@ -815,7 +832,13 @@ function renderDashboard(container) {
       value: tasks.filter(t => t.assignee_id === m.id &&
         !(smap[t.status_id] && smap[t.status_id].is_done)).length,
     })),
-    { label: '未割当', color: '#cbd5e1', value: tasks.filter(t => !t.assignee_id).length },
+    ...virtualAssignees().map(l => ({
+      label: l, color: '#64748b',
+      value: tasks.filter(t => !t.assignee_id && t.assignee_label === l &&
+        !(smap[t.status_id] && smap[t.status_id].is_done)).length,
+    })),
+    { label: '未割当', color: '#cbd5e1',
+      value: tasks.filter(t => !t.assignee_id && !t.assignee_label).length },
   ];
   const prioColors = { highest: '#ef4444', high: '#f97316', medium: '#6366f1', low: '#94a3b8' };
   const prioItems = ['highest', 'high', 'medium', 'low'].map(p => ({
@@ -1883,6 +1906,17 @@ function renderSettingsPage(container) {
       ${chk('unassigned_can_comment', '未アサインの社内ユーザーのコメントを許可', 'OFFにするとPJメンバー以外は閲覧のみ')}
     </div>
 
+    <div class="dash-card span6"><h3>👤 担当者の追加選択肢（メンバー以外）</h3>
+      <p class="set-hint">アサインされているメンバー以外に、担当者として選べるラベルを定義します
+        （例: 顧客・先方・ベンダーA・未定）。ボードの担当者別列やフィルターにも表示されます。</p>
+      <div id="set-vas">${(s.virtual_assignees || []).map(l => `
+        <div class="cf-row" data-va>
+          <input data-f="label" value="${U.esc(l)}" placeholder="例: 顧客">
+          <button class="icon-btn" data-del-va>🗑</button>
+        </div>`).join('')}</div>
+      <button class="btn sm" id="set-add-va">＋ 選択肢を追加</button>
+    </div>
+
     <div class="dash-card span6"><h3>外部ユーザーの既定・制限</h3>
       <p class="set-hint">新しく外部ユーザーをアサインしたときの初期値。個別の変更はメンバー管理から。</p>
       ${chk('external_default_view_comments', '外部にコメント閲覧を既定で許可')}
@@ -1963,8 +1997,17 @@ function renderSettingsPage(container) {
   };
   const bindTplRows = () => {
     container.querySelectorAll('[data-del-tpl]').forEach(b => b.onclick = () => b.closest('[data-tpl]').remove());
+    container.querySelectorAll('[data-del-va]').forEach(b => b.onclick = () => b.closest('[data-va]').remove());
   };
   bindTplRows();
+  container.querySelector('#set-add-va').onclick = () => {
+    document.getElementById('set-vas').insertAdjacentHTML('beforeend', `
+      <div class="cf-row" data-va>
+        <input data-f="label" value="" placeholder="例: 顧客">
+        <button class="icon-btn" data-del-va>🗑</button>
+      </div>`);
+    bindTplRows();
+  };
   container.querySelector('#set-apply-tpl').onclick = async () => {
     await saveSettings();   // テンプレ編集を反映してから
     const r = await API.applyNoteTemplate(p.id, State.currentUserId);
@@ -1974,6 +2017,8 @@ function renderSettingsPage(container) {
   const collectSettings = () => {
     const out = { ...s };
     container.querySelectorAll('[data-set]').forEach(cb => { out[cb.dataset.set] = cb.checked; });
+    out.virtual_assignees = [...container.querySelectorAll('[data-va] [data-f=label]')]
+      .map(i => i.value.trim()).filter(Boolean);
     out.webhook_url = container.querySelector('#set-webhook').value.trim();
     out.webhook_events = [...container.querySelectorAll('[data-wevent]')]
       .filter(cb => cb.checked).map(cb => cb.dataset.wevent);
