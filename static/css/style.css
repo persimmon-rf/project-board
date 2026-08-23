@@ -672,6 +672,32 @@ table.task-table { width: 100%; border-collapse: collapse; font-size: 13px; min-
   pointer-events: none; z-index: 1;
 }
 
+/* ================= 担当者カラー・期限色分け ================= */
+.a-dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  margin-right: 5px; vertical-align: middle; flex-shrink: 0;
+}
+.assignee-cell select { max-width: 120px; }
+.assignee-cell .no-assignee { color: var(--muted); }
+.parent-cell { color: var(--muted); font-size: 12px; }
+/* テーブルの期限: 超過=赤 / 3日以内=琥珀（input自体も着色） */
+.task-table td.overdue input[type=date] { color: #dc2626; font-weight: 700; background: #fef2f2; border-radius: 6px; }
+.task-table td.soon input[type=date] { color: #b45309; font-weight: 600; background: #fffbeb; border-radius: 6px; }
+/* ガントの期間セル */
+.g-due-overdue { color: #dc2626 !important; font-weight: 700; background: #fef2f2; border-radius: 4px; }
+.g-due-soon { color: #b45309 !important; font-weight: 600; }
+
+/* ================= dashboard toolbar / clickable ================= */
+.dash-toolbar { display: flex; align-items: center; margin-bottom: 8px; }
+.dash-card.clickable { cursor: pointer; transition: box-shadow .12s, transform .12s; }
+.dash-card.clickable:hover { box-shadow: 0 4px 14px rgba(15, 23, 42, .16); transform: translateY(-1px); }
+.special-chip {
+  background: #fee2e2; color: #b91c1c; border-radius: 12px; padding: 3px 10px;
+  font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 6px;
+}
+.special-chip .x { cursor: pointer; opacity: .7; }
+.special-chip .x:hover { opacity: 1; }
+
 /* ================= toast ================= */
 #toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px);

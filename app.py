@@ -173,6 +173,12 @@ CREATE TABLE IF NOT EXISTS task_links (
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY, value TEXT
 );
+CREATE TABLE IF NOT EXISTS user_prefs (
+    member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT DEFAULT '{}',
+    PRIMARY KEY (member_id, key)
+);
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
@@ -2329,6 +2335,41 @@ def ai_context(project_id: Optional[int] = None):
                         for s in d["statuses"]],
             "wbs": wbs, "notes": notes, "comments": comments}
 
+
+
+# ---------------------------------------------------------------- API: ユーザー表示設定（担当者カラー・ダッシュボード配置など）
+
+@app.get("/api/prefs")
+def get_prefs(user_id: Optional[int] = None):
+    uid = resolve_uid(user_id)
+    if uid is None:
+        return {}
+    with db() as conn:
+        rows = conn.execute("SELECT key, value FROM user_prefs WHERE member_id=?",
+                            (uid,)).fetchall()
+    out = {}
+    for r in rows:
+        try:
+            out[r["key"]] = json.loads(r["value"])
+        except ValueError:
+            pass
+    return out
+
+
+@app.post("/api/prefs")
+def set_pref(body: dict):
+    uid = resolve_uid(body.get("user_id"))
+    key = (body.get("key") or "").strip()
+    if uid is None or not key:
+        raise HTTPException(400, "user_id と key が必要です")
+    with db() as conn:
+        if body.get("value") is None:
+            conn.execute("DELETE FROM user_prefs WHERE member_id=? AND key=?", (uid, key))
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO user_prefs(member_id, key, value) VALUES(?,?,?)",
+                (uid, key, json.dumps(body["value"], ensure_ascii=False)))
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- API: 通知

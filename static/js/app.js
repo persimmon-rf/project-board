@@ -10,7 +10,8 @@ const State = {
   view: 'home',
   boardGroup: 'status',
   currentUserId: null,
-  filters: { keyword: '', assignee: '', priority: '', tag: '', hideDone: false },
+  filters: { keyword: '', assignee: '', priority: '', tag: '', hideDone: false, special: '' },
+  prefs: {},               // 表示ユーザーごとの設定（担当者カラー・ダッシュボード配置）
   tableSort: { key: null, dir: 'asc' },
   ganttCollapsed: new Set(),
 };
@@ -92,7 +93,32 @@ function assigneeName(t) {
   return m ? m.name : (t.assignee_label || null);
 }
 function virtualAvatarHtml(label, extra = '') {
-  return `<span class="avatar va ${extra}" title="${U.esc(label)}（仮想担当）">${U.esc(label.slice(0, 2))}</span>`;
+  const ov = (State.prefs && State.prefs.assignee_colors) || {};
+  const color = ov['v:' + label] || '#64748b';
+  return `<span class="avatar va ${extra}" style="background:${U.esc(color)}" title="${U.esc(label)}（仮想担当）">${U.esc(label.slice(0, 2))}</span>`;
+}
+/* 表示ユーザーごとの担当者カラー（メンバー: 'u:id' / 仮想担当: 'v:ラベル'） */
+function assigneeColorOf(t) {
+  const ov = (State.prefs && State.prefs.assignee_colors) || {};
+  if (t.assignee_id) {
+    const m = memberMap()[t.assignee_id];
+    return ov['u:' + t.assignee_id] || (m ? m.color : null);
+  }
+  if (t.assignee_label) return ov['v:' + t.assignee_label] || '#64748b';
+  return null;
+}
+async function saveAssigneeColor(key, color) {
+  const map = { ...(State.prefs.assignee_colors || {}) };
+  map[key] = color;
+  State.prefs.assignee_colors = map;
+  try {
+    await API.setPref(State.currentUserId, 'assignee_colors', map);
+  } catch (e) { toast(e.message); }
+}
+async function loadPrefs() {
+  try {
+    State.prefs = await API.getPrefs(State.currentUserId) || {};
+  } catch (e) { State.prefs = {}; }
 }
 function taskAvatarHtml(t, extra = '') {
   if (t.assignee_id) return U.avatarHtml(memberMap()[t.assignee_id], extra);
@@ -130,8 +156,21 @@ function filteredTasks() {
     if (f.priority && t.priority !== f.priority) return false;
     if (f.tag && !t.tags.includes(f.tag)) return false;
     if (f.hideDone && smap[t.status_id] && smap[t.status_id].is_done) return false;
+    if (f.special === 'done' &&
+        !(smap[t.status_id] && smap[t.status_id].is_done)) return false;
+    if (f.special === 'overdue') {
+      const done = smap[t.status_id] && smap[t.status_id].is_done;
+      if (done || !t.due_date || t.due_date >= U.todayStr()) return false;
+    }
     return true;
   });
+}
+
+/* ダッシュボードのカードクリック → 条件付きテーブル表示 */
+function goTableFiltered(special) {
+  State.filters.special = special || '';
+  State.view = 'table';
+  render();
 }
 
 /* ---------------- toast ---------------- */
@@ -537,6 +576,7 @@ function renderSidebar() {
 async function switchViewUser(uid) {
   State.currentUserId = uid;
   try {
+    await loadPrefs();
     await loadBootstrap();
     if (State.pid && !State.projects.some(p => p.id === State.pid)) {
       State.pid = null; State.project = null; State.tasks = [];
@@ -684,6 +724,22 @@ function renderFilterOptions() {
   ft.value = tags.includes(curTag) ? curTag : '';
   renderSavedFilters();
   bindSavedFilterEvents();
+
+  // 特殊フィルター（ダッシュボードカード由来）のチップ
+  let chip = document.getElementById('f-special');
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.id = 'f-special';
+    document.getElementById('f-count').before(chip);
+  }
+  const labels = { done: '✅ 完了のみ', overdue: '⚠ 期限超過のみ' };
+  if (State.filters.special) {
+    chip.innerHTML = `<span class="special-chip">${labels[State.filters.special] || ''}
+      <span class="x" title="解除">✕</span></span>`;
+    chip.querySelector('.x').onclick = () => { State.filters.special = ''; render(); };
+  } else {
+    chip.innerHTML = '';
+  }
 }
 
 /* ---------------- modals: task ---------------- */
@@ -942,6 +998,9 @@ function openAssignModal() {
         return `
         <div class="status-edit-row" data-pm="${m.id}">
           ${U.avatarHtml(m)}
+          <input type="color" data-ucolor="${m.id}"
+            value="${((State.prefs.assignee_colors || {})['u:' + m.id]) || m.color}"
+            title="あなたの画面でのこのユーザーの表示色（全プロジェクト共通・自分にだけ反映）">
           <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">${U.esc(m.name)}
             ${m.account_type === 'external' ? '<span class="ext-chip">外部</span>' : ''}</span>
           <select data-role="${m.id}" style="width:100px" ${roleOpts.length === 1 ? 'disabled title="外部アカウントはexternal固定"' : ''}>
@@ -956,6 +1015,16 @@ function openAssignModal() {
         </div>`;
       }).join('') || '<div style="color:var(--muted);font-size:13px">まだメンバーがいません</div>'}
     </div>
+    ${virtualAssignees().length ? `<div class="form-row"><label>メンバー以外の担当（PJ設定で定義）— 表示色</label>
+      ${virtualAssignees().map(l => `
+        <div class="status-edit-row">
+          ${virtualAvatarHtml(l)}
+          <input type="color" data-vcolor="${U.esc(l)}"
+            value="${((State.prefs.assignee_colors || {})['v:' + l]) || '#64748b'}"
+            title="あなたの画面での表示色">
+          <span style="flex:1">${U.esc(l)}</span>
+        </div>`).join('')}
+    </div>` : ''}
     <div class="form-row"><label>ユーザーを追加アサイン（外部ユーザーは自動的に「外部」ロール・閲覧制限つき）</label>${candHtml}</div>
     <div class="modal-actions">
       <button class="btn left" id="am-new-user">＋ 新規ユーザー作成</button>
@@ -1002,6 +1071,21 @@ function openAssignModal() {
   document.getElementById('am-new-user').onclick = () => {
     openUserModal(null, { onSaved: openAssignModal });
   };
+  // 表示色の割り当て（表示ユーザーごとに保存・全PJ共通）
+  document.querySelectorAll('#modal [data-ucolor]').forEach(inp => {
+    inp.onchange = async () => {
+      await saveAssigneeColor('u:' + inp.dataset.ucolor, inp.value);
+      render();   // 背後のビューに即反映（モーダルは開いたまま）
+      toast('表示色を保存しました（自分の画面にのみ反映）');
+    };
+  });
+  document.querySelectorAll('#modal [data-vcolor]').forEach(inp => {
+    inp.onchange = async () => {
+      await saveAssigneeColor('v:' + inp.dataset.vcolor, inp.value);
+      render();
+      toast('表示色を保存しました（自分の画面にのみ反映）');
+    };
+  });
 }
 
 /* ---------------- login ---------------- */
@@ -1058,6 +1142,7 @@ async function init() {
     return;
   }
   State.currentUserId = State.loginUser.id;
+  await loadPrefs();
   await loadBootstrap();
   const savedPid = Number(localStorage.getItem('pjboard.pid'));
   const target = State.projects.find(p => p.id === savedPid) || State.projects[0];

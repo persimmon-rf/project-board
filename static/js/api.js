@@ -127,6 +127,8 @@ const API = {
   latestBaseline: (pid) => API.get(`/api/projects/${pid}/baseline`),
   metrics: (pid) => API.get(`/api/projects/${pid}/metrics`),
   weeklySummary: (pid, actor) => API.post(`/api/projects/${pid}/summary`, { actor_id: actor }),
+  getPrefs: (uid) => API.get(`/api/prefs?user_id=${uid}`),
+  setPref: (uid, key, value) => API.post('/api/prefs', { user_id: uid, key, value }),
 };
 
 /* ================= 共有ユーティリティ ================= */
@@ -157,7 +159,11 @@ const U = {
   },
   avatarHtml(member, extra = '') {
     if (!member) return `<span class="avatar unassigned ${extra}" title="未割当">–</span>`;
-    return `<span class="avatar ${extra}" style="background:${U.esc(member.color)}" title="${U.esc(member.name)}">${U.esc(U.initials(member.name))}</span>`;
+    // 表示ユーザーごとのカラー割り当て（user_prefs）があれば優先
+    const ov = (typeof State !== 'undefined' && State.prefs &&
+                State.prefs.assignee_colors) || {};
+    const color = (member.id && ov['u:' + member.id]) || member.color;
+    return `<span class="avatar ${extra}" style="background:${U.esc(color)}" title="${U.esc(member.name)}">${U.esc(U.initials(member.name))}</span>`;
   },
   prioLabel: { highest: '最優先', high: '高', medium: '中', low: '低' },
   prioHtml(p) {

@@ -331,9 +331,12 @@ function tableRowHtml(t, smap, mmap, cfDefs, vis, bulk) {
     <td><select data-edit="status_id" ${dis('status_id')}>
       ${State.statuses.map(s => `<option value="${s.id}" ${s.id === t.status_id ? 'selected' : ''}>${U.esc(s.name)}</option>`).join('')}
     </select></td>
-    <td><select data-edit="assignee_id" ${dis('assignee_id')}>
+    ${hasChildren(t.id)
+      ? `<td class="assignee-cell parent-cell" title="下位タスクで担当を管理します"><span class="no-assignee">—</span></td>`
+      : `<td class="assignee-cell" ${assigneeColorOf(t) ? `style="box-shadow:inset 3px 0 0 ${assigneeColorOf(t)}"` : ''}>
+      ${(t.assignee_id || t.assignee_label) ? `<span class="a-dot" style="background:${assigneeColorOf(t)}"></span>` : ''}<select data-edit="assignee_id" ${dis('assignee_id')}>
       ${assigneeOptionsHtml(t)}
-    </select></td>
+    </select></td>`}
     ${vis.prio ? `<td><select data-edit="priority" ${dis('priority')}>
       ${['highest', 'high', 'medium', 'low'].map(p => `<option value="${p}" ${p === t.priority ? 'selected' : ''}>${U.prioLabel[p]}</option>`).join('')}
     </select></td>` : ''}
@@ -440,7 +443,9 @@ function renderGantt(container) {
   const leftRows = rows.map(t => {
     const kids = hasChildren(t.id);
     const isCollapsed = collapsed.has(t.id);
-    const aname = assigneeName(t);
+    const aname = hasChildren(t.id) ? null : assigneeName(t);
+    const aColor = assigneeColorOf(t);
+    const dueCls2 = U.dueClass(t, smap);
     return `<div class="g-row ${G.edit ? 'g-editable-row' : ''}" data-row="${t.id}" ${G.edit ? 'draggable="true"' : ''}>
       <span class="g-wbs">${G.edit ? '<span class="g-grip" title="ドラッグで並べ替え">⠿</span>' : ''}${U.esc(t.wbs)}</span>
       <div class="g-cell-name" style="width:${G.nameW}px;min-width:${G.nameW}px;padding-left:${8 + t.depth * 14}px">
@@ -452,8 +457,10 @@ function renderGantt(container) {
           <button class="g-tool" data-outdent="${t.id}" title="1階層上げる">⭠</button>
         </span>` : ''}
       </div>
-      <span class="g-cell-sm g-col-a" title="${aname ? U.esc(aname) : ''}">${aname ? U.esc(aname.split(/[\s　]/)[0]) : '—'}</span>
-      <span class="g-cell-sm g-col-d">${fmtShort(t.start_date)}${(t.start_date || t.due_date) ? '〜' : ''}${fmtShort(t.due_date)}</span>
+      <span class="g-cell-sm g-col-a" title="${aname ? U.esc(aname) : ''}"
+        ${aname && aColor ? `style="color:${aColor};font-weight:600"` : ''}>${aname
+          ? `<span class="a-dot" style="background:${aColor}"></span>` + U.esc(aname.split(/[\s　]/)[0]) : '—'}</span>
+      <span class="g-cell-sm g-col-d ${dueCls2 ? 'g-due-' + dueCls2 : ''}">${fmtShort(t.start_date)}${(t.start_date || t.due_date) ? '〜' : ''}${fmtShort(t.due_date)}${dueCls2 === 'overdue' ? ' ⚠' : ''}</span>
       <span class="g-cell-sm g-col-p">${t.progress}%</span>
     </div>`;
   }).join('');
@@ -812,6 +819,29 @@ function setupGanttInteractions(container, ctx) {
 /* =====================================================================
  *  ダッシュボード
  * =================================================================== */
+/* =====================================================================
+ *  ダッシュボード（ウィジェット方式・ユーザーごとに表示/配置をカスタマイズ可能）
+ * =================================================================== */
+const DASH_WIDGETS = [
+  ['stat_total', '📋 タスク総数'], ['stat_done', '✅ 完了'],
+  ['stat_overdue', '⚠ 期限超過'], ['stat_avg', '📈 平均進捗'],
+  ['status_donut', '🍩 ステータス別'], ['member_bar', '👥 担当者別残タスク'],
+  ['priority_bar', '🔺 優先度別'], ['week_load', '📅 週別負荷'],
+  ['deadlines', '⏰ 期限が近いタスク'], ['mini_board', '🗂 簡易ボード'],
+  ['activity', '📰 アクティビティ'], ['burndown', '📉 バーンダウン'],
+  ['risks', '🚨 リスクタスク'], ['effort', '⏱ 工数'], ['report', '📄 レポート'],
+];
+
+function dashLayout() {
+  const all = DASH_WIDGETS.map(w => w[0]);
+  let ids = (Array.isArray(State.prefs.dash_layout) && State.prefs.dash_layout.length)
+    ? State.prefs.dash_layout.filter(id => all.includes(id))
+    : all;
+  // 優先度を非表示にしたPJでは優先度ウィジェットを出さない
+  if (!fieldVisible('priority')) ids = ids.filter(id => id !== 'priority_bar');
+  return ids;
+}
+
 function renderDashboard(container) {
   const tasks = State.tasks;
   const smap = statusMap();
@@ -822,18 +852,19 @@ function renderDashboard(container) {
     !(smap[t.status_id] && smap[t.status_id].is_done)).length;
   const avg = total ? Math.round(tasks.reduce((a, t) => a + t.progress, 0) / total) : 0;
 
-  const statusItems = State.statuses.map(s => ({
-    label: s.name, color: s.color,
-    value: tasks.filter(t => t.status_id === s.id).length,
+  const statusItems = State.statuses.map(st => ({
+    label: st.name, color: st.color,
+    value: tasks.filter(t => t.status_id === st.id).length,
   }));
+  const ov = (State.prefs && State.prefs.assignee_colors) || {};
   const memberItems = [
     ...State.members.map(m => ({
-      label: m.name.split(/[\s　]/)[0], color: m.color,
+      label: m.name.split(/[\s　]/)[0], color: ov['u:' + m.id] || m.color,
       value: tasks.filter(t => t.assignee_id === m.id &&
         !(smap[t.status_id] && smap[t.status_id].is_done)).length,
     })),
     ...virtualAssignees().map(l => ({
-      label: l, color: '#64748b',
+      label: l, color: ov['v:' + l] || '#64748b',
       value: tasks.filter(t => !t.assignee_id && t.assignee_label === l &&
         !(smap[t.status_id] && smap[t.status_id].is_done)).length,
     })),
@@ -841,92 +872,101 @@ function renderDashboard(container) {
       value: tasks.filter(t => !t.assignee_id && !t.assignee_label).length },
   ];
   const prioColors = { highest: '#ef4444', high: '#f97316', medium: '#6366f1', low: '#94a3b8' };
-  const prioItems = ['highest', 'high', 'medium', 'low'].map(p => ({
-    label: U.prioLabel[p], color: prioColors[p],
-    value: tasks.filter(t => t.priority === p).length,
+  const prioItems = ['highest', 'high', 'medium', 'low'].map(pr => ({
+    label: U.prioLabel[pr], color: prioColors[pr],
+    value: tasks.filter(t => t.priority === pr).length,
   }));
-
-  // 週別の期限件数（負荷の見える化）
   const weeks = [];
   const wkStart = new Date();
-  wkStart.setDate(wkStart.getDate() - wkStart.getDay() + 1 - 14);  // 2週前の月曜から
+  wkStart.setDate(wkStart.getDate() - wkStart.getDay() + 1 - 14);
   for (let i = 0; i < 10; i++) {
-    const s = new Date(wkStart.getTime() + i * 7 * DAY);
-    const e = new Date(s.getTime() + 6 * DAY);
-    const si = s.toISOString().slice(0, 10), ei = e.toISOString().slice(0, 10);
+    const sd = new Date(wkStart.getTime() + i * 7 * DAY);
+    const ed = new Date(sd.getTime() + 6 * DAY);
+    const si = sd.toISOString().slice(0, 10), ei = ed.toISOString().slice(0, 10);
     weeks.push({
-      label: `${s.getMonth() + 1}/${s.getDate()}`,
+      label: `${sd.getMonth() + 1}/${sd.getDate()}`,
       value: tasks.filter(t => t.due_date && t.due_date >= si && t.due_date <= ei).length,
     });
   }
-
   const upcoming = tasks
     .filter(t => t.due_date && !(smap[t.status_id] && smap[t.status_id].is_done))
     .sort((a, b) => a.due_date < b.due_date ? -1 : 1).slice(0, 8);
-
   const legendHtml = (items) => `<div class="legend">${items.map(i => `
     <div class="row"><span class="dot" style="background:${i.color}"></span>
     ${U.esc(i.label)}<span class="val">${i.value}</span></div>`).join('')}</div>`;
 
-  container.innerHTML = `<div class="dash">
-    <div class="dash-card span3"><h3>タスク総数</h3><div class="stat-num">${total}</div>
-      <div class="stat-sub">サブタスク含む</div></div>
-    <div class="dash-card span3"><h3>完了</h3><div class="stat-num green">${done}</div>
-      <div class="stat-sub">${total ? Math.round(done / total * 100) : 0}% 完了</div></div>
-    <div class="dash-card span3"><h3>期限超過</h3><div class="stat-num ${overdue ? 'red' : ''}">${overdue}</div>
-      <div class="stat-sub">要対応</div></div>
-    <div class="dash-card span3"><h3>平均進捗</h3><div class="stat-num">${avg}%</div>
-      <div class="stat-sub">全タスク平均</div></div>
+  // ---- ウィジェット定義（id → HTML）
+  const W = {};
+  W.stat_total = `<div class="dash-card span3 clickable" data-go="" title="クリックで全タスクの一覧へ">
+    <h3>タスク総数</h3><div class="stat-num">${total}</div><div class="stat-sub">クリックで一覧表示</div></div>`;
+  W.stat_done = `<div class="dash-card span3 clickable" data-go="done" title="クリックで完了タスクの一覧へ">
+    <h3>完了</h3><div class="stat-num green">${done}</div>
+    <div class="stat-sub">${total ? Math.round(done / total * 100) : 0}% 完了・クリックで一覧</div></div>`;
+  W.stat_overdue = `<div class="dash-card span3 clickable" data-go="overdue" title="クリックで期限超過の一覧へ">
+    <h3>期限超過</h3><div class="stat-num ${overdue ? 'red' : ''}">${overdue}</div>
+    <div class="stat-sub">クリックで一覧表示</div></div>`;
+  W.stat_avg = `<div class="dash-card span3"><h3>平均進捗</h3>
+    <div class="stat-num">${avg}%</div><div class="stat-sub">全タスク平均</div></div>`;
+  W.status_donut = `<div class="dash-card span4"><h3>ステータス別</h3>
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;justify-content:center">
+      ${Charts.donut(statusItems)}${legendHtml(statusItems)}</div></div>`;
+  W.member_bar = `<div class="dash-card span4"><h3>担当者別 残タスク</h3>
+    ${Charts.hbar(memberItems, { width: 300 })}</div>`;
+  W.priority_bar = `<div class="dash-card span4"><h3>優先度別</h3>
+    ${Charts.hbar(prioItems, { width: 300 })}</div>`;
+  W.week_load = `<div class="dash-card span8"><h3>週別 期限タスク数（負荷）</h3>
+    ${Charts.line(weeks.map(w => w.value),
+      { width: 640, height: 160, labels: weeks.map((w, i) => i % 2 === 0 ? w.label : '') })}</div>`;
+  W.deadlines = `<div class="dash-card span4"><h3>期限が近いタスク</h3>
+    <ul class="deadline-list">${upcoming.map(t => {
+      const cls = U.dueClass(t, smap);
+      return `<li data-open="${t.id}">
+        ${taskAvatarHtml(t)}
+        <span class="t">${U.esc(t.title)}</span>
+        <span class="due ${cls}">${U.fmtDate(t.due_date)}</span></li>`;
+    }).join('') || '<div class="empty-note">なし</div>'}</ul></div>`;
+  W.mini_board = `<div class="dash-card span8"><h3>簡易ボード</h3>
+    <div class="mini-board">${State.statuses.map(st => {
+      const stt = tasks.filter(t => t.status_id === st.id);
+      return `<div class="mini-col"><h4 style="border-color:${U.esc(st.color)}">${U.esc(st.name)} (${stt.length})</h4>
+        ${stt.slice(0, 5).map(t => `<div class="mini-card" data-open="${t.id}">${U.esc(t.title)}</div>`).join('')}
+        ${stt.length > 5 ? `<div class="mini-more">他 ${stt.length - 5} 件</div>` : ''}</div>`;
+    }).join('')}</div></div>`;
+  W.activity = `<div class="dash-card span4"><h3>最近のアクティビティ</h3>
+    <ul class="act-list">${(State.activities || []).slice(0, 10).map(a => `
+      <li><span class="act-badge">${U.esc(actLabel(a.action))}</span>
+        <b>${U.esc(a.task_title || '')}</b> ${U.esc(a.detail || '')}
+        <div>${U.esc(a.actor_name || 'システム')} ・ ${U.esc((a.created_at || '').slice(5, 16))}</div></li>`).join('') ||
+      '<div class="empty-note">なし</div>'}</ul></div>`;
+  W.burndown = `<div class="dash-card span6"><h3>📉 バーンダウン（残タスク・直近30日）</h3>
+    <div id="dash-burndown" class="empty-note">読み込み中…</div></div>`;
+  W.risks = `<div class="dash-card span6"><h3>⚠ リスクタスク（期限接近×進捗低・超過）</h3>
+    <div id="dash-risks" class="empty-note">読み込み中…</div></div>`;
+  W.effort = `<div class="dash-card span6"><h3>⏱ 工数（見積 / 実績）</h3>
+    <div id="dash-effort" class="empty-note">読み込み中…</div></div>`;
+  W.report = `<div class="dash-card span6"><h3>📄 レポート</h3>
+    <p style="color:var(--muted);font-size:12.5px">進捗・完了・リスクを集計した週次サマリーを
+      ノート（カテゴリ: レポート）に自動生成します。Webhook設定があれば同時に送信されます。</p>
+    ${canEditNotes() ? '<button class="btn primary sm" id="dash-summary">週次サマリーを作成</button>' : ''}
+    <a class="btn sm" href="/api/projects/${State.pid}/calendar.ics" download
+      style="text-decoration:none;display:inline-block;margin-left:6px">📅 iCal（Outlook購読用）</a></div>`;
 
-    <div class="dash-card span4"><h3>ステータス別</h3>
-      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;justify-content:center">
-        ${Charts.donut(statusItems)}${legendHtml(statusItems)}</div></div>
-    <div class="dash-card span4"><h3>担当者別 残タスク</h3>${Charts.hbar(memberItems, { width: 300 })}</div>
-    <div class="dash-card span4"><h3>優先度別</h3>${Charts.hbar(prioItems, { width: 300 })}</div>
-
-    <div class="dash-card span8"><h3>週別 期限タスク数（負荷）</h3>
-      ${Charts.line(weeks.map(w => w.value), { width: 640, height: 160, labels: weeks.map((w, i) => i % 2 === 0 ? w.label : '') })}</div>
-    <div class="dash-card span4"><h3>期限が近いタスク</h3>
-      <ul class="deadline-list">${upcoming.map(t => {
-        const cls = U.dueClass(t, smap);
-        return `<li data-open="${t.id}">
-          ${U.avatarHtml(memberMap()[t.assignee_id])}
-          <span class="t">${U.esc(t.title)}</span>
-          <span class="due ${cls}">${U.fmtDate(t.due_date)}</span></li>`;
-      }).join('') || '<div class="empty-note">なし</div>'}</ul></div>
-
-    <div class="dash-card span8"><h3>簡易ボード</h3>
-      <div class="mini-board">${State.statuses.map(s => {
-        const st = tasks.filter(t => t.status_id === s.id);
-        return `<div class="mini-col"><h4 style="border-color:${U.esc(s.color)}">${U.esc(s.name)} (${st.length})</h4>
-          ${st.slice(0, 5).map(t => `<div class="mini-card" data-open="${t.id}">${U.esc(t.title)}</div>`).join('')}
-          ${st.length > 5 ? `<div class="mini-more">他 ${st.length - 5} 件</div>` : ''}</div>`;
-      }).join('')}</div></div>
-
-    <div class="dash-card span6"><h3>📉 バーンダウン（残タスク・直近30日）</h3>
-      <div id="dash-burndown" class="empty-note">読み込み中…</div></div>
-    <div class="dash-card span6"><h3>⚠ リスクタスク（期限接近×進捗低・超過）</h3>
-      <div id="dash-risks" class="empty-note">読み込み中…</div></div>
-    <div class="dash-card span6"><h3>⏱ 工数（見積 / 実績）</h3>
-      <div id="dash-effort" class="empty-note">読み込み中…</div></div>
-    <div class="dash-card span6"><h3>📄 レポート</h3>
-      <p style="color:var(--muted);font-size:12.5px">進捗・完了・リスクを集計した週次サマリーを
-        ノート（カテゴリ: レポート）に自動生成します。Webhook設定があれば同時に送信されます。</p>
-      ${canEditNotes() ? '<button class="btn primary sm" id="dash-summary">週次サマリーを作成</button>' : ''}
-      <a class="btn sm" href="/api/projects/${State.pid}/calendar.ics" download style="text-decoration:none;display:inline-block;margin-left:6px">📅 iCal（Outlook購読用）</a>
+  const layout = dashLayout();
+  container.innerHTML = `
+    <div class="dash-toolbar">
+      <span class="spacer"></span>
+      <button class="btn sm ghost" id="dash-customize" title="このダッシュボードに表示する項目と並び順を変更（自分の画面にのみ反映）">⚙ 表示カスタマイズ</button>
     </div>
-
-    <div class="dash-card span4"><h3>最近のアクティビティ</h3>
-      <ul class="act-list">${(State.activities || []).slice(0, 10).map(a => `
-        <li><span class="act-badge">${U.esc(actLabel(a.action))}</span>
-          <b>${U.esc(a.task_title || '')}</b> ${U.esc(a.detail || '')}
-          <div>${U.esc(a.actor_name || 'システム')} ・ ${U.esc((a.created_at || '').slice(5, 16))}</div></li>`).join('') ||
-        '<div class="empty-note">なし</div>'}</ul></div>
-  </div>`;
+    <div class="dash">${layout.map(id => W[id] || '').join('')}</div>`;
 
   container.querySelectorAll('[data-open]').forEach(el => {
     el.addEventListener('click', () => openDetail(Number(el.dataset.open)));
   });
+  // 統計カードのクリック → 条件付きテーブル
+  container.querySelectorAll('[data-go]').forEach(el => {
+    el.addEventListener('click', () => goTableFiltered(el.dataset.go));
+  });
+  container.querySelector('#dash-customize').onclick = openDashCustomizeModal;
   const sumBtn = container.querySelector('#dash-summary');
   if (sumBtn) sumBtn.onclick = async () => {
     sumBtn.disabled = true;
@@ -936,7 +976,60 @@ function renderDashboard(container) {
     } catch (err) { toast(err.message); }
     sumBtn.disabled = false;
   };
-  loadDashboardMetrics(container);
+  if (layout.some(id => ['burndown', 'risks', 'effort'].includes(id))) {
+    loadDashboardMetrics(container);
+  }
+}
+
+/* ダッシュボードの表示カスタマイズ（表示ユーザーごとに保存） */
+function openDashCustomizeModal() {
+  const current = dashLayout();
+  const all = DASH_WIDGETS.filter(([id]) => id !== 'priority_bar' || fieldVisible('priority'));
+  // 現在の並び順（表示中）＋非表示のもの
+  const ordered = [...current.map(id => all.find(w => w[0] === id)).filter(Boolean),
+                   ...all.filter(w => !current.includes(w[0]))];
+  showModal(`
+    <h2>⚙ ダッシュボードの表示カスタマイズ</h2>
+    <p style="color:var(--muted);font-size:12.5px;margin:0 0 10px">
+      チェック=表示、↑↓=並び順。この設定は<b>あなたの画面にのみ</b>反映されます。</p>
+    <div id="dc-list">${ordered.map(([id, label]) => `
+      <div class="status-edit-row" data-wid="${id}">
+        <input type="checkbox" ${current.includes(id) ? 'checked' : ''}>
+        <span style="flex:1">${label}</span>
+        <button class="icon-btn" data-up>↑</button>
+        <button class="icon-btn" data-down>↓</button>
+      </div>`).join('')}</div>
+    <div class="modal-actions">
+      <button class="btn left" id="dc-reset">既定に戻す</button>
+      <button class="btn" data-close>キャンセル</button>
+      <button class="btn primary" id="dc-save">保存</button>
+    </div>`);
+  const list = document.getElementById('dc-list');
+  list.querySelectorAll('[data-up]').forEach(b => b.onclick = () => {
+    const row = b.closest('[data-wid]');
+    if (row.previousElementSibling) row.parentElement.insertBefore(row, row.previousElementSibling);
+  });
+  list.querySelectorAll('[data-down]').forEach(b => b.onclick = () => {
+    const row = b.closest('[data-wid]');
+    if (row.nextElementSibling) row.parentElement.insertBefore(row.nextElementSibling, row);
+  });
+  document.getElementById('dc-save').onclick = async () => {
+    const ids = [...list.querySelectorAll('[data-wid]')]
+      .filter(r => r.querySelector('input').checked)
+      .map(r => r.dataset.wid);
+    State.prefs.dash_layout = ids;
+    await API.setPref(State.currentUserId, 'dash_layout', ids);
+    closeModal();
+    render();
+    toast('ダッシュボードの表示を保存しました');
+  };
+  document.getElementById('dc-reset').onclick = async () => {
+    delete State.prefs.dash_layout;
+    await API.setPref(State.currentUserId, 'dash_layout', null);
+    closeModal();
+    render();
+    toast('既定の表示に戻しました');
+  };
 }
 
 /* メトリクス（バーンダウン・工数・リスク）を非同期で流し込む */
