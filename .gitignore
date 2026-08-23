@@ -1,0 +1,14 @@
+# 業務データ（DB・添付・バックアップ）は絶対にコミットしない
+data/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 統合前の旧実装アーカイブ（ローカル保管のみ）
+_archive/
+
+# OS/エディタ
+Thumbs.db
+.DS_Store

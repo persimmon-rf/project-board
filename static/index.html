@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PJ Board</title>
+<link rel="stylesheet" href="/css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect x='8' y='15' width='24' height='70' rx='5' fill='%234f6ef7'/><rect x='38' y='15' width='24' height='45' rx='5' fill='%23f59e0b'/><rect x='68' y='15' width='24' height='58' rx='5' fill='%2322c55e'/></svg>">
+</head>
+<body>
+<div id="app">
+  <!-- ======== サイドバー ======== -->
+  <aside id="sidebar">
+    <div class="brand">
+      <span class="brand-logo">▦</span> PJ Board
+    </div>
+    <div class="side-section">
+      <ul>
+        <li id="nav-home">🏠 <span>マイダッシュボード</span></li>
+      </ul>
+    </div>
+    <div class="side-section">
+      <div class="side-head">
+        <span>プロジェクト</span>
+        <button class="icon-btn" id="btn-new-project" title="新規プロジェクト">＋</button>
+      </div>
+      <ul id="project-list"></ul>
+    </div>
+    <div class="side-section">
+      <div class="side-head">
+        <span>プロジェクトメンバー</span>
+        <button class="icon-btn" id="btn-assign-member" title="ユーザーをアサイン">＋</button>
+      </div>
+      <ul id="member-list"></ul>
+    </div>
+    <div class="side-section">
+      <ul>
+        <li id="nav-org-admin">🏢 <span>組織・ユーザー管理</span></li>
+      </ul>
+    </div>
+    <div class="side-footer">
+      <div id="login-user-box"></div>
+      <div id="debug-user-box" class="hidden">
+        <label>👁 表示のみ切替（マネージャー専用・ログインは維持）</label>
+        <select id="current-user"></select>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ======== メイン ======== -->
+  <main id="main">
+    <header id="topbar">
+      <div class="proj-title">
+        <span id="proj-color-dot" class="proj-dot"></span>
+        <h1 id="proj-name">—</h1>
+        <button class="icon-btn" id="btn-proj-settings" title="プロジェクト設定">⚙</button>
+      </div>
+      <nav id="view-tabs">
+        <button data-view="dashboard">📊 ダッシュボード</button>
+        <button data-view="board">📋 ボード</button>
+        <button data-view="table">📑 テーブル</button>
+        <button data-view="gantt">📅 WBS / ガント</button>
+        <button data-view="calendar">📆 カレンダー</button>
+        <button data-view="issues">💬 コメント一覧</button>
+        <button data-view="notes">📖 ノート</button>
+      </nav>
+      <div class="topbar-right">
+        <button class="btn ghost" id="btn-search" title="横断検索 (Ctrl+K)">🔍</button>
+        <div class="dropdown" id="notif-dd">
+          <button class="btn ghost" id="btn-notif" title="通知">🔔<span id="notif-badge" class="notif-badge hidden"></span></button>
+          <div class="dropdown-menu notif-menu" id="notif-menu"></div>
+        </div>
+        <div id="debug-login-box" class="hidden" title="デバッグ: ログインユーザーを完全に切り替えます（セッションごと入れ替え）">
+          🔧 <select id="debug-login-user"></select>
+        </div>
+        <div class="dropdown" id="export-dd">
+          <button class="btn ghost" id="btn-export">⬇ エクスポート</button>
+          <div class="dropdown-menu">
+            <a id="exp-html" href="#" download>HTMLレポート（アーカイブ用）</a>
+            <a id="exp-xlsx" href="#" download>Excel (.xlsx)</a>
+            <a id="exp-csv" href="#" download>CSV</a>
+            <a id="exp-json" href="#" download>JSON（バックアップ・連携用）</a>
+          </div>
+        </div>
+        <button class="btn primary" id="btn-new-task">＋ タスク追加</button>
+      </div>
+    </header>
+
+    <!-- フィルターバー -->
+    <div id="filterbar">
+      <input type="search" id="f-keyword" placeholder="🔍 キーワード検索">
+      <select id="f-assignee"><option value="">担当者: 全員</option></select>
+      <select id="f-priority">
+        <option value="">優先度: すべて</option>
+        <option value="highest">最優先</option>
+        <option value="high">高</option>
+        <option value="medium">中</option>
+        <option value="low">低</option>
+      </select>
+      <select id="f-tag"><option value="">タグ: すべて</option></select>
+      <label class="chk"><input type="checkbox" id="f-hide-done"> 完了を隠す</label>
+      <select id="f-saved" title="保存済みフィルタを適用"></select>
+      <button class="icon-btn" id="f-save" title="現在のフィルタ条件を保存">☆</button>
+      <span id="f-count" class="f-count"></span>
+      <span class="spacer"></span>
+      <div id="board-group-toggle" class="seg hidden">
+        <button data-group="status" class="active">ステータス別</button>
+        <button data-group="assignee">担当者別</button>
+      </div>
+    </div>
+
+    <div id="view-container"></div>
+  </main>
+
+  <!-- ======== タスク詳細パネル（スライドオーバー） ======== -->
+  <div id="detail-overlay" class="hidden"></div>
+  <aside id="detail-panel" class="hidden"></aside>
+
+  <!-- ======== 汎用モーダル ======== -->
+  <div id="modal-overlay" class="hidden">
+    <div id="modal"></div>
+  </div>
+
+  <div id="toast"></div>
+</div>
+
+<!-- ======== ログイン画面 ======== -->
+<div id="login-screen" class="hidden"></div>
+
+<!-- ======== 横断検索オーバーレイ (Ctrl+K) ======== -->
+<div id="search-overlay" class="hidden">
+  <div class="search-box">
+    <input id="search-input" placeholder="🔍 タスク・コメント・ノートを横断検索（Esc で閉じる）">
+    <div id="search-results"></div>
+  </div>
+</div>
+
+<script src="/js/api.js"></script>
+<script src="/js/charts.js"></script>
+<script src="/js/views.js"></script>
+<script src="/js/detail.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>
