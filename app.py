@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 PJ Board — 社内向けセルフホスト・プロジェクト管理ツール
 FastAPI + SQLite 単一プロセス構成。閉域ネットワークで動作（外部CDN依存なし）。
@@ -33,7 +33,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 app = FastAPI(
     title="PJ Board API",
-    version="0.3.0",
+    version="0.3.1",
     description=(
         "社内プロジェクト管理ツール PJ Board の REST API。\n\n"
         "AIエージェント向けの要点:\n"
