@@ -9,7 +9,7 @@
 | インスタンス | `test-kakita-nb-tool`（t3.micro / Amazon Linux 2023） |
 | VPC / サブネット | NetBox検証系と同じ（vpc-0113020f… / subnet-0b85121a…） |
 | キーペア | `auto_g`（NetBox1号機と同じ） |
-| SG | `test-kakita-nb-tool`: 22・8100 を社用IPからのみ許可 |
+| SG | NetBox1号機と共用（launch-wizard-45）。22・8000・8100 を社用IPからのみ許可（8100はこのツール用に追加） |
 | IP | パブリックIP（変動。再起動で変わる点はNetBox検証機と同運用） |
 | アプリ | `/opt/pjboard`（このリポジトリのclone）・systemd `pjboard.service`・ポート8100 |
 | データ | `/opt/pjboard/data/`（gitignore対象。構築時にローカルからスナップショット移行済み） |
