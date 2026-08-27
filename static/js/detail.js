@@ -69,7 +69,7 @@ function renderDetailPanel(d) {
   panel.innerHTML = `
     <div class="dp-head">
       <span class="id">#${t.id}</span>
-      ${parent ? `<button class="btn sm ghost" id="dp-goto-parent">↑ ${U.esc(parent.title)}</button>` : ''}
+      ${parent ? `<button class="btn sm ghost" id="dp-goto-parent">↑ ${U.esc(taskLabel(parent))}</button>` : ''}
       <span class="spacer" style="flex:1"></span>
       <button class="icon-btn" id="dp-watch" title="${d.watching ? 'ウォッチ中（クリックで解除）' : 'ウォッチする（変更が通知されます）'}"
         style="font-size:15px">${d.watching ? '🔔' : '🔕'}</button>
@@ -108,13 +108,13 @@ function renderDetailPanel(d) {
         <label>親タスク</label>
         <select id="dp-parent" ${dis('parent_id')}>
           <option value="">（なし）</option>
-          ${State.tasks.filter(x => x.id !== t.id && !isDescendant(x.id, t.id))
-            .map(x => `<option value="${x.id}" ${x.id === t.parent_id ? 'selected' : ''}>${U.esc(x.title)}</option>`).join('')}
+          ${buildWbs(State.tasks).filter(x => x.id !== t.id && !isDescendant(x.id, t.id))
+            .map(x => `<option value="${x.id}" ${x.id === t.parent_id ? 'selected' : ''}>${U.esc(taskLabel(x))}</option>`).join('')}
         </select>
         <label>先行タスク</label>
         <select id="dp-deps" multiple size="3" title="Ctrl+クリックで複数選択" ${dis('deps')}>
-          ${State.tasks.filter(x => x.id !== t.id)
-            .map(x => `<option value="${x.id}" ${(t.deps || []).includes(x.id) ? 'selected' : ''}>${U.esc(x.title)}</option>`).join('')}
+          ${buildWbs(State.tasks).filter(x => x.id !== t.id)
+            .map(x => `<option value="${x.id}" ${(t.deps || []).includes(x.id) ? 'selected' : ''}>${U.esc(taskLabel(x))}</option>`).join('')}
         </select>
         <label>繰り返し</label>
         <select id="dp-recur" ${dis('recur')} title="完了にすると次回分が自動作成されます">
@@ -125,9 +125,10 @@ function renderDetailPanel(d) {
       </div>
 
       <div class="dp-section">
-        <h3>進捗</h3>
+        <h3>進捗${d.subtasks.length ? '（サブタスクから自動算出）' : ''}</h3>
         <div class="range-row">
-          <input type="range" id="dp-progress" min="0" max="100" step="5" value="${t.progress}" ${dis('progress')}>
+          <input type="range" id="dp-progress" min="0" max="100" step="5" value="${t.progress}"
+            ${d.subtasks.length ? 'disabled title="サブタスクの進捗の平均が自動反映されます"' : dis('progress')}>
           <span class="range-val" id="dp-progress-val">${t.progress}%</span>
         </div>
       </div>
@@ -153,7 +154,7 @@ function renderDetailPanel(d) {
             const done = smap[s.status_id] && smap[s.status_id].is_done;
             return `<li data-sub="${s.id}">
               <span>${done ? '✅' : '⬜'}</span>
-              <span class="${done ? 'done' : ''}" style="flex:1">${U.esc(s.title)}</span>
+              <span class="${done ? 'done' : ''}" style="flex:1">${U.esc(taskLabel(s))}</span>
               <span class="mini-pbar"><div style="width:${s.progress}%"></div></span>
               ${U.avatarHtml(memberMap()[s.assignee_id])}</li>`;
           }).join('') || '<div class="empty-note" style="padding:8px;font-size:12px">なし</div>'}
@@ -196,7 +197,7 @@ function renderDetailPanel(d) {
         <ul class="link-list">
           ${(d.relations || []).map(r => `<li>
             <span class="kind-chip">${r.kind === 'blocks' ? '⛔ ブロック' : '↔ 関連'}</span>
-            <a href="#" data-open-task="${r.other_id}">${U.esc(r.other_title)}</a>
+            <a href="#" data-open-task="${r.other_id}">${U.esc(wbsOf(r.other_id) ? wbsOf(r.other_id) + ' ' + r.other_title : r.other_title)}</a>
             <span style="flex:1"></span>
             ${canEditTask(t) ? `<button class="icon-btn" data-del-rel="${r.id}">🗑</button>` : ''}</li>`).join('') ||
             '<div class="empty-note" style="padding:8px;font-size:12px">なし</div>'}
@@ -459,8 +460,8 @@ function openRelationModal(tid) {
     <h2>🔗 タスク間リンクを追加</h2>
     <div class="form-row"><label>相手タスク</label>
       <select id="rel-other">
-        ${State.tasks.filter(x => x.id !== tid)
-          .map(x => `<option value="${x.id}">${U.esc(x.title)}</option>`).join('')}
+        ${buildWbs(State.tasks).filter(x => x.id !== tid)
+          .map(x => `<option value="${x.id}">${U.esc(taskLabel(x))}</option>`).join('')}
       </select></div>
     <div class="form-row"><label>種類</label>
       <select id="rel-kind">

@@ -380,42 +380,56 @@ function currentHash() {
   return h;
 }
 
+let _applyingHash = false;   // 戻る/進む適用中は履歴を書き換えない
+
 function syncHash() {
+  if (_applyingHash) return;
   const h = currentHash();
-  // replaceState なら hashchange は発火せず、履歴も汚さない
-  if (location.hash !== h) history.replaceState(null, '', h);
+  if (location.hash === h) return;
+  // 画面遷移を履歴に積む（戻る/進む対応）。初回（ハッシュ無し）だけは置換
+  if (location.hash) history.pushState(null, '', h);
+  else history.replaceState(null, '', h);
 }
 
 async function applyHash() {
-  if (location.hash.startsWith('#/home')) {
-    State.view = 'home';
-    render();
-    return true;
-  }
-  if (location.hash.startsWith('#/admin')) {
-    State.view = 'admin';
-    render();
-    return true;
-  }
-  const th = location.hash.match(/^#\/p\/(\d+)\/thread\/(\d+)/);
-  if (th) {
-    const pid = Number(th[1]);
+  _applyingHash = true;
+  try {
+    if (location.hash.startsWith('#/home')) {
+      if (detailTaskId) closeDetail();
+      State.view = 'home';
+      render();
+      return true;
+    }
+    if (location.hash.startsWith('#/admin')) {
+      if (detailTaskId) closeDetail();
+      State.view = 'admin';
+      render();
+      return true;
+    }
+    const th = location.hash.match(/^#\/p\/(\d+)\/thread\/(\d+)/);
+    if (th) {
+      const pid = Number(th[1]);
+      if (!State.projects.some(p => p.id === pid)) return false;
+      if (State.pid !== pid) await loadProject(pid);
+      if (detailTaskId) closeDetail();
+      State.view = 'thread';
+      State.threadTaskId = Number(th[2]);
+      render();
+      return true;
+    }
+    const m = location.hash.match(/^#\/p\/(\d+)\/(dashboard|board|table|gantt|calendar|issues|notes|settings)(?:\/t\/(\d+))?/);
+    if (!m) return false;
+    const pid = Number(m[1]);
     if (!State.projects.some(p => p.id === pid)) return false;
     if (State.pid !== pid) await loadProject(pid);
-    State.view = 'thread';
-    State.threadTaskId = Number(th[2]);
+    State.view = m[2];
     render();
+    if (m[3]) await openDetail(Number(m[3]));
+    else if (detailTaskId) closeDetail();
     return true;
+  } finally {
+    _applyingHash = false;
   }
-  const m = location.hash.match(/^#\/p\/(\d+)\/(dashboard|board|table|gantt|calendar|issues|notes|settings)(?:\/t\/(\d+))?/);
-  if (!m) return false;
-  const pid = Number(m[1]);
-  if (!State.projects.some(p => p.id === pid)) return false;
-  if (State.pid !== pid) await loadProject(pid);
-  State.view = m[2];
-  render();
-  if (m[3]) openDetail(Number(m[3]));
-  return true;
 }
 
 /* ---------------- data load ---------------- */
@@ -692,7 +706,7 @@ function renderTopbar() {
       const uid = Number(sel.value);
       if (uid === State.loginUser.id) return;
       try {
-        await API.debugLogin(uid);
+        await API.debugLogin({ member_id: uid });
         location.reload();   // セッションが切り替わったので全体を再読込
       } catch (err) {
         toast(err.message);
@@ -700,12 +714,180 @@ function renderTopbar() {
       }
     };
   }
-  if (p) {
-    document.getElementById('exp-html').href = `/api/projects/${p.id}/export.html`;
-    document.getElementById('exp-xlsx').href = `/api/projects/${p.id}/export.xlsx`;
-    document.getElementById('exp-csv').href = `/api/projects/${p.id}/export.csv`;
-    document.getElementById('exp-json').href = `/api/projects/${p.id}/export.json`;
+  if (p) document.getElementById('btn-export').onclick = openExportModal;
+}
+
+/* ---------------- エクスポートモーダル ---------------- */
+function openExportModal() {
+  const p = State.project;
+  if (!p) { toast('先にプロジェクトを選択してください'); return; }
+  const views = [['table', '📑 テーブル'], ['gantt', '📅 WBS / ガント'],
+                 ['board', '📋 ボード'], ['calendar', '📆 カレンダー'],
+                 ['dashboard', '📊 ダッシュボード']];
+  const cur = views.some(v => v[0] === State.view) ? State.view : 'table';
+  showModal(`
+    <h2>⬇ エクスポート</h2>
+    <div class="form-row"><label>プロジェクト全体（案件終了後のアーカイブ・バックアップ）</label>
+      <div class="exp-btns">
+        <a class="btn" href="/api/projects/${p.id}/export.html" download>📦 アーカイブHTML<small>カンバン・WBS・議論・ノート・履歴込み</small></a>
+        <a class="btn" href="/api/projects/${p.id}/export.xlsx" download>📗 Excel (.xlsx)<small>サマリー/WBS/コメント/リンク/ノート</small></a>
+        <a class="btn" href="/api/projects/${p.id}/export.csv" download>📄 CSV<small>一覧表・インポート互換</small></a>
+        <a class="btn" href="/api/projects/${p.id}/export.json" download>🗂 JSON<small>全データバックアップ</small></a>
+      </div></div>
+    <div class="form-row" style="margin-top:14px"><label>ページ（画面）単位 — 顧客提出用など</label>
+      <div class="form-cols">
+        <div class="form-row"><label>ページ</label>
+          <select id="ex-view">${views.map(([v, l]) =>
+            `<option value="${v}" ${v === cur ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+        <div class="form-row"><label>形式</label>
+          <select id="ex-format">
+            <option value="html">HTML（Web表示と同じ見た目）</option>
+            <option value="xlsx">Excel（整形済み）</option>
+          </select></div>
+      </div>
+      <p style="color:var(--muted);font-size:12px;margin:6px 0 0" id="ex-note"></p>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" data-close>閉じる</button>
+      <button class="btn primary" id="ex-run">⬇ ページを出力</button>
+    </div>`);
+  const viewSel = document.getElementById('ex-view');
+  const fmtSel = document.getElementById('ex-format');
+  const sync = () => {
+    const dash = viewSel.value === 'dashboard';
+    fmtSel.querySelector('[value=xlsx]').disabled = dash;
+    if (dash) fmtSel.value = 'html';
+    document.getElementById('ex-note').textContent =
+      fmtSel.value === 'xlsx' && viewSel.value === 'gantt'
+        ? 'WBSのExcelは日単位のガントチャート形式（担当者色バー・進捗の濃淡・週末/今日マーカー・ウィンドウ枠固定）で出力します。'
+        : dash ? 'ダッシュボードはHTML出力のみ対応です（数値の一覧は「全体Excel」のサマリーシートへ）。'
+        : 'フィルター適用状態のまま出力します。HTMLはブラウザで開いて印刷→PDF保存も可能です。';
+  };
+  viewSel.onchange = sync; fmtSel.onchange = sync; sync();
+  document.getElementById('ex-run').onclick = async () => {
+    const view = viewSel.value, fmt = fmtSel.value;
+    closeModal();
+    try {
+      if (fmt === 'xlsx') await exportViewXlsx(view);
+      else await exportViewHtml(view);
+    } catch (err) { toast('出力に失敗しました: ' + err.message); }
+  };
+}
+
+/* ---------------- ページ単位のHTML出力 ---------------- */
+function exportTableCleanHtml(root) {
+  // テーブルのフォーム部品（select/input）を値のテキストに変換したきれいな表を作る
+  const src = root.querySelector('table.task-table');
+  if (!src) return null;
+  const rows = [...src.querySelectorAll('tr')].map(tr => {
+    const tag = tr.closest('thead') ? 'th' : 'td';
+    const cells = [...tr.children]
+      .filter(c => !c.querySelector('input[type=checkbox]'))
+      .map(c => {
+        const sel = c.querySelector('select');
+        const inp = c.querySelector('input');
+        const v = sel ? (sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : '')
+          : inp ? inp.value
+          : c.textContent.trim();
+        return `<${tag}>${U.esc(v)}</${tag}>`;
+      }).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+  return `<table class="exp-table">${rows}</table>`;
+}
+
+async function exportViewHtml(view) {
+  const p = State.project;
+  const names = { dashboard: 'ダッシュボード', board: 'ボード', table: 'テーブル',
+                  gantt: 'WBSガント', calendar: 'カレンダー' };
+  const vname = names[view];
+  // アプリの実CSSを取り込む（読み込み中の<link>から実URLを取得）
+  let css = '';
+  try {
+    const link = document.querySelector('link[rel=stylesheet]');
+    const res = await fetch(link ? link.href : '/css/style.css');
+    if (res.ok) css = await res.text();
+  } catch (e) { /* 装飾なしで続行 */ }
+  if (!css) { toast('スタイルの取得に失敗したため出力を中止しました'); return; }
+  // 表示中のビューはそのままDOMを、他ビューは画面外に描画してから取り込む
+  let root = document.getElementById('view-container');
+  let off = null;
+  if (view !== State.view) {
+    off = document.createElement('div');
+    off.style.cssText = 'position:absolute;left:-12000px;top:0;width:1400px;background:#fff';
+    document.body.appendChild(off);
+    ({ dashboard: renderDashboard, board: renderBoard, table: renderTable,
+       gantt: renderGantt, calendar: renderCalendar })[view](off);
+    await new Promise(r => setTimeout(r, 800));   // 非同期チャートの描画待ち
+    root = off;
   }
+  const body = (view === 'table' && exportTableCleanHtml(root)) || root.innerHTML;
+  if (off) off.remove();
+  const today = U.todayStr();
+  const doc = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<title>${U.esc(p.name)} - ${vname}</title>
+<style>${css}</style>
+<style>
+/* ===== エクスポート専用の上書き（アプリのレイアウト前提を解除して1枚のページにする） ===== */
+html,body{height:auto!important;overflow:visible!important}
+body{display:block;padding:24px 28px}
+button,.gantt-toolbar,.g-rowtools,.g-grip,.g-tool,.g-resize,.g-resize-l,.dash-toolbar,.cal-more,.board-col-add{display:none!important}
+*{pointer-events:none!important;user-select:text!important}
+.exp-head{margin-bottom:18px;border-left:6px solid ${U.esc(p.color)};padding-left:12px}
+.exp-head h1{margin:0;font-size:22px}
+.exp-head p{margin:4px 0 0;color:#64748b;font-size:13px}
+.exp-table{border-collapse:collapse;width:100%;font-size:13px;background:#fff}
+.exp-table th,.exp-table td{border:1px solid #d8deea;padding:6px 9px;text-align:left;vertical-align:middle}
+.exp-table th{background:#2f4870;color:#fff;white-space:nowrap}
+#view-container{overflow:visible!important;max-height:none!important;height:auto!important;padding:0!important}
+.gantt-wrap{overflow:visible!important;max-height:none!important;height:auto!important}
+.board-col{max-height:none!important}
+.board-col-body{overflow:visible!important}
+@media print{body{padding:0}}
+</style></head><body>
+<div class="exp-head"><h1>${U.esc(p.name)} — ${vname}</h1>
+<p>出力日: ${today} ／ Generated by PJ Board</p></div>
+<div id="view-container">${body}</div>
+</body></html>`;
+  const blob = new Blob([doc], { type: 'text/html' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${p.name}_${vname}_${today}.html`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+  toast(`${vname}をHTMLファイルとして出力しました（印刷→PDF保存で提出用にできます）`);
+}
+
+/* ---------------- ページ単位のExcel出力（サーバー生成） ---------------- */
+async function exportViewXlsx(view) {
+  const p = State.project;
+  const names = { board: 'ボード', table: 'テーブル', gantt: 'WBSガント', calendar: 'カレンダー' };
+  const res = await fetch(`/api/projects/${p.id}/export/view.xlsx`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' },
+    body: JSON.stringify({
+      view: view === 'gantt' ? 'wbs' : view,
+      ids: filteredTasks().map(t => t.id),            // フィルター適用状態を反映
+      colors: (State.prefs && State.prefs.assignee_colors) || {},
+      month: State.calMonth || null,
+    }),
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { msg = (await res.json()).detail || msg; } catch (e) { /* noop */ }
+    throw new Error(msg);
+  }
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${p.name}_${names[view]}_${U.todayStr()}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+  toast(`${names[view]}をExcelファイルとして出力しました`);
 }
 
 function renderFilterOptions() {
@@ -759,8 +941,8 @@ function openTaskModal(preset = {}) {
           <option value="highest">最優先</option><option value="high">高</option>
           <option value="medium" selected>中</option><option value="low">低</option></select></div>
       <div class="form-row"><label>親タスク</label>
-        <select id="nt-parent"><option value="">（なし）</option>${State.tasks.map(t =>
-          `<option value="${t.id}" ${t.id === preset.parent_id ? 'selected' : ''}>${U.esc(t.title)}</option>`).join('')}</select></div>
+        <select id="nt-parent"><option value="">（なし）</option>${buildWbs(State.tasks).map(t =>
+          `<option value="${t.id}" ${t.id === preset.parent_id ? 'selected' : ''}>${U.esc(taskLabel(t))}</option>`).join('')}</select></div>
       <div class="form-row"><label>開始日</label><input type="date" id="nt-start" value="${U.esc(preset.start_date || '')}"></div>
       <div class="form-row"><label>期限</label><input type="date" id="nt-due" value="${U.esc(preset.due_date || '')}"></div>
       <div class="form-row"><label>見積 (h)</label><input type="number" id="nt-est" min="0" step="0.5"></div>
@@ -896,7 +1078,7 @@ function openUserModal(mid = null, { defaultOrgId = null, onSaved = null } = {})
           <option value="">（無所属）</option>
           ${State.orgs.map(o => `<option value="${o.id}" ${o.id === orgSel ? 'selected' : ''}>${U.esc(o.name)}</option>`).join('')}
         </select></div>
-      <div class="form-row"><label>メールアドレス（SSO連携用・任意）</label>
+      <div class="form-row"><label>メールアドレス（ログインID）*</label>
         <input id="nm-email" type="email" value="${U.esc(m ? (m.email || '') : '')}" placeholder="taro@example.com"></div>
       <div class="form-row"><label>アカウント種別</label>
         <select id="nm-acct">
@@ -930,16 +1112,20 @@ function openUserModal(mid = null, { defaultOrgId = null, onSaved = null } = {})
   document.getElementById('nm-save').onclick = async () => {
     const name = document.getElementById('nm-name').value.trim();
     if (!name) { toast('名前を入力してください'); return; }
+    const email = document.getElementById('nm-email').value.trim();
+    if (!email || !email.includes('@')) { toast('メールアドレスを入力してください'); return; }
     const orgVal = document.getElementById('nm-org').value;
     const body = {
       name, role: document.getElementById('nm-role').value.trim(),
       color: swatchValue('nm-colors'),
       org_id: orgVal ? Number(orgVal) : null,
       account_type: document.getElementById('nm-acct').value,
-      email: document.getElementById('nm-email').value.trim() || null,
+      email,
     };
-    if (m) await API.updateMember(m.id, body);
-    else await API.createMember(body);
+    try {
+      if (m) await API.updateMember(m.id, body);
+      else await API.createMember(body);
+    } catch (err) { toast(err.message); return; }
     await done();
   };
   if (m) {
@@ -1093,36 +1279,29 @@ async function renderLoginScreen() {
   const scr = document.getElementById('login-screen');
   document.getElementById('app').classList.add('hidden');
   scr.classList.remove('hidden');
-  let users = [];
-  try { users = await API.authUsers(); } catch (e) { /* noop */ }
+  let cfg = { debug: false };
+  try { cfg = await API.authConfig(); } catch (e) { /* noop */ }
   scr.innerHTML = `
     <div class="login-card">
       <div class="brand" style="justify-content:center;font-size:22px;color:#1f2937">
         <span class="brand-logo">▦</span> PJ Board
       </div>
       <p style="color:var(--muted);font-size:13px;text-align:center;margin:4px 0 18px">
-        ユーザーを選択してログインしてください</p>
-      <div class="form-row"><label>ユーザー</label>
-        <select id="li-user">${users.map(u => `
-          <option value="${u.id}">${U.esc(u.name)}（${U.esc(u.org_name || '無所属')}${u.account_type === 'external' ? '・外部' : ''}）</option>`).join('')}
-        </select></div>
+        メールアドレスとパスワードでログインしてください</p>
+      <div class="form-row"><label>メールアドレス</label>
+        <input type="email" id="li-email" placeholder="taro@example.com" autocomplete="username"></div>
       <div class="form-row"><label>パスワード</label>
-        <input type="password" id="li-pass" placeholder="未設定の場合は空欄のまま">
-        <div id="li-hint" style="color:var(--muted);font-size:11.5px;margin-top:4px"></div></div>
+        <input type="password" id="li-pass" placeholder="未設定の場合は空欄のまま" autocomplete="current-password"></div>
       <button class="btn primary" id="li-login" style="width:100%;padding:10px">ログイン</button>
       <div id="li-error" style="color:var(--danger);font-size:13px;margin-top:10px;text-align:center"></div>
+      ${cfg.debug ? `<button class="btn ghost" id="li-debug" style="width:100%;margin-top:14px"
+        title="開発用: パスワード不要で「柿田」としてログインします（本番では表示されません）">
+        🔧 デバッグ用ログイン（柿田）</button>` : ''}
     </div>`;
-  const sel = document.getElementById('li-user');
-  const hint = () => {
-    const u = users.find(x => x.id === Number(sel.value));
-    document.getElementById('li-hint').textContent =
-      u && !u.has_password ? 'このユーザーはパスワード未設定です（ログイン後に🔑から設定できます）' : '';
-  };
-  sel.onchange = hint;
-  hint();
   const doLogin = async () => {
     try {
-      await API.login(Number(sel.value), document.getElementById('li-pass').value);
+      await API.login(document.getElementById('li-email').value.trim(),
+                      document.getElementById('li-pass').value);
       location.reload();
     } catch (err) {
       document.getElementById('li-error').textContent = err.message;
@@ -1130,6 +1309,16 @@ async function renderLoginScreen() {
   };
   document.getElementById('li-login').onclick = doLogin;
   document.getElementById('li-pass').onkeydown = (e) => { if (e.key === 'Enter') doLogin(); };
+  document.getElementById('li-email').onkeydown = (e) => { if (e.key === 'Enter') doLogin(); };
+  const dbg = document.getElementById('li-debug');
+  if (dbg) dbg.onclick = async () => {
+    try {
+      await API.debugLogin({ name: '柿田' });
+      location.reload();
+    } catch (err) {
+      document.getElementById('li-error').textContent = err.message;
+    }
+  };
 }
 
 /* ---------------- init / events ---------------- */
@@ -1149,7 +1338,13 @@ async function init() {
   if (target) await loadProject(target.id);
   // URLハッシュ（共有リンク）があればそのビュー・タスクを復元、無ければホーム
   if (!(await applyHash())) render();
-  window.addEventListener('hashchange', applyHash);
+  // 戻る/進む（ブラウザ履歴）→ ハッシュを画面状態に反映。未知のハッシュはホームへ
+  window.addEventListener('hashchange', async () => {
+    if (!(await applyHash())) {
+      State.view = 'home';
+      render();
+    }
+  });
 
   // ビュータブ
   document.querySelectorAll('#view-tabs button').forEach(b => {

@@ -17,7 +17,9 @@ H = {"X-Requested-With": "fetch"}   # CSRFヘッダー（Cookieセッション�
 
 
 def login(member_id, password=""):
-    r = client.post("/api/auth/login", json={"member_id": member_id, "password": password},
+    # メールログイン化に伴い、シードのダミーメール（user{id}@example.com）で認証する
+    r = client.post("/api/auth/login",
+                    json={"email": f"user{member_id}@example.com", "password": password},
                     headers=H)
     assert r.status_code == 200, r.text
     return r
@@ -154,8 +156,10 @@ def test_login_throttle():
                 headers=H)
     logout()
     for _ in range(5):
-        client.post("/api/auth/login", json={"member_id": 1, "password": "bad"}, headers=H)
-    r = client.post("/api/auth/login", json={"member_id": 1, "password": "pw1"}, headers=H)
+        client.post("/api/auth/login",
+                    json={"email": "user1@example.com", "password": "bad"}, headers=H)
+    r = client.post("/api/auth/login",
+                    json={"email": "user1@example.com", "password": "pw1"}, headers=H)
     assert r.status_code == 429
     # 後始末（DBを直接触ってロック解除・パスワード解除）
     with appmod.db() as conn:
@@ -178,3 +182,82 @@ def test_export_endpoints():
     for ext in ("csv", "xlsx", "html", "json"):
         assert client.get(f"/api/projects/1/export.{ext}").status_code == 200
     assert client.get("/api/projects/1/calendar.ics").status_code == 200
+
+
+def test_email_login_and_debug_login():
+    # 存在しないメールは401（存在有無を悟らせない共通メッセージ）
+    r = client.post("/api/auth/login", json={"email": "nobody@example.com"}, headers=H)
+    assert r.status_code == 401
+    # デバッグログインは未ログイン＋名前指定で可（開発時のみ）
+    r = client.post("/api/auth/debug-login", json={"name": "田中 太郎"}, headers=H)
+    assert r.status_code == 200 and r.json()["user"]["name"] == "田中 太郎"
+    logout()
+
+
+def test_parent_progress_autocalc():
+    """サブタスクを持つタスクの進捗は子の平均から自動算出（直接指定は無視）。"""
+    login(1)
+    mk = lambda body: client.post("/api/projects/1/tasks",
+                                  json={**body, "actor_id": 1}, headers=H).json()
+    parent = mk({"title": "進捗自動テスト親"})
+    c1 = mk({"title": "子1", "parent_id": parent["id"]})
+    mk({"title": "子2", "parent_id": parent["id"]})
+    client.patch(f"/api/tasks/{c1['id']}",
+                 json={"progress": 100, "actor_id": 1}, headers=H)
+    d = client.get(f"/api/tasks/{parent['id']}/detail").json()
+    assert d["task"]["progress"] == 50          # (100 + 0) / 2
+    # 親タスクへの直接指定は無視され自動算出値が維持される
+    r = client.patch(f"/api/tasks/{parent['id']}",
+                     json={"progress": 10, "actor_id": 1}, headers=H)
+    assert r.status_code == 200
+    d = client.get(f"/api/tasks/{parent['id']}/detail").json()
+    assert d["task"]["progress"] == 50
+    logout()
+
+
+def test_status_progress_sync():
+    """進捗0=未着手 / 1-99=進行中 / 100=完了 の双方向連動。"""
+    login(1)
+    t = client.post("/api/projects/1/tasks",
+                    json={"title": "連動テスト", "actor_id": 1}, headers=H).json()
+    sts = client.get("/api/projects/1/data").json()["statuses"]
+    first = sts[0]
+    mid = next(s for s in sts if "進行" in s["name"])
+    done = next(s for s in sts if s["is_done"])
+    patch = lambda body: client.patch(f"/api/tasks/{t['id']}",
+                                      json={**body, "actor_id": 1}, headers=H).json()
+    assert patch({"progress": 40})["status_id"] == mid["id"]
+    assert patch({"progress": 100})["status_id"] == done["id"]
+    assert patch({"status_id": first["id"]})["progress"] == 0
+    assert patch({"status_id": mid["id"]})["progress"] == 50
+    r = patch({"progress": 0})
+    assert r["status_id"] == first["id"] and r["progress"] == 0
+    # 中間ステータス（レビュー中等）は 1-99 の進捗変更で上書きしない
+    review = next((s for s in sts if not s["is_done"] and s["id"] != first["id"]
+                   and "進行" not in s["name"]), None)
+    if review:
+        patch({"status_id": review["id"]})
+        assert patch({"progress": 80})["status_id"] == review["id"]
+    logout()
+
+
+def test_view_xlsx_export():
+    login(1)
+    for view in ("table", "wbs", "board", "calendar"):
+        r = client.post("/api/projects/1/export/view.xlsx",
+                        json={"view": view}, headers=H)
+        assert r.status_code == 200 and len(r.content) > 2000, view
+    logout()
+
+
+def test_member_email_required_and_unique():
+    login(1)
+    base = {"name": "メール必須テスト", "role": "", "color": "#111111"}
+    r = client.post("/api/members", json={**base, "email": ""}, headers=H)
+    assert r.status_code == 400
+    r = client.post("/api/members", json={**base, "email": "user1@example.com"}, headers=H)
+    assert r.status_code == 400          # 既存と重複
+    r = client.post("/api/members", json={**base, "email": "New.User@Example.com"},
+                    headers=H)
+    assert r.status_code == 200 and r.json()["email"] == "new.user@example.com"
+    logout()

@@ -27,11 +27,27 @@ function hasChildren(tid) {
   return State.tasks.some(t => t.parent_id === tid);
 }
 
+/* ---------- WBS番号の参照（State.tasks が入れ替わったら再計算） ---------- */
+let _wbsCache = { src: null, map: {} };
+function wbsOf(tid) {
+  if (_wbsCache.src !== State.tasks) {
+    _wbsCache = { src: State.tasks, map: {} };
+    for (const t of buildWbs(State.tasks)) _wbsCache.map[t.id] = t.wbs;
+  }
+  return _wbsCache.map[tid] || '';
+}
+/* タスク名の表示用ラベル（頭にWBS番号を付ける） */
+function taskLabel(t) {
+  const w = wbsOf(t.id);
+  return (w && w !== '-') ? `${w} ${t.title}` : t.title;
+}
+
 /* =====================================================================
  *  ボードビュー
  * =================================================================== */
 function renderBoard(container) {
-  const tasks = filteredTasks();
+  // サブタスクを持つ親タスクは表示しない（実作業の単位＝子タスクのみを扱う）
+  const tasks = filteredTasks().filter(t => !hasChildren(t.id));
   const smap = statusMap();
   const byStatus = State.boardGroup === 'status';
 
@@ -97,7 +113,7 @@ function cardHtml(t, smap, byStatus) {
   const dueCls = U.dueClass(t, smap);
   const draggable = byStatus ? canEditField(t, 'status_id') : canEditField(t, 'assignee_id');
   return `<div class="card ${dueCls === 'overdue' ? 'overdue' : ''} ${draggable ? '' : 'no-drag'}" draggable="${draggable}" data-id="${t.id}">
-    <div class="card-title">${t.milestone ? '<span class="msdiamond">◆</span> ' : ''}${U.esc(t.title)}</div>
+    <div class="card-title">${t.milestone ? '<span class="msdiamond">◆</span> ' : ''}${U.esc(taskLabel(t))}</div>
     <div class="card-meta">
       ${fieldVisible('priority') ? U.prioHtml(t.priority) : ''}
       ${!byStatus && st ? `<span class="badge" style="background:${U.esc(st.color)}">${U.esc(st.name)}</span>` : ''}
@@ -476,8 +492,9 @@ function renderGantt(container) {
   }).join('');
 
   const bars = rows.map((t, i) => {
-    const st = smap[t.status_id];
-    const color = st ? st.color : '#94a3b8';
+    // バーは担当者の表示色で塗る（未割当はグレー、親タスクは中立色）
+    const color = hasChildren(t.id) ? '#8b95a7'
+      : (assigneeColorOf(t) || '#94a3b8');
     const y = i * rowH;
     if (t.milestone && t.due_date) {
       return `<div class="g-ms" data-open="${t.id}" style="left:${x(t.due_date) + dayW / 2 - 7}px;top:${y + 10}px" title="${U.esc(t.title)} (${t.due_date})"></div>`;
@@ -489,9 +506,9 @@ function renderGantt(container) {
     const parent = hasChildren(t.id);
     return `<div class="g-bar ${parent ? 'parent' : ''} ${G.edit && !parent ? 'editable' : ''}" data-bar="${t.id}"
         style="left:${left}px;top:${y + (parent ? 13 : 8)}px;width:${w}px;background:${U.esc(color)}"
-        title="${U.esc(t.title)}  ${s} 〜 ${e}  進捗${t.progress}%">
+        title="${U.esc(t.wbs)} ${U.esc(t.title)}  ${s} 〜 ${e}  進捗${t.progress}%">
       <div class="fill" style="width:${t.progress}%"></div>
-      ${!parent && w > 80 ? `<span class="g-bar-label">${U.esc(t.title)}</span>` : ''}
+      ${!parent && w > 80 ? `<span class="g-bar-label">${U.esc(t.wbs)} ${U.esc(t.title)}</span>` : ''}
       ${G.edit && !parent ? `<div class="g-resize-l" data-resize-l="${t.id}" title="開始日のみ変更"></div>
         <div class="g-resize" data-resize="${t.id}" title="期限のみ変更"></div>` : ''}
     </div>`;
@@ -517,6 +534,11 @@ function renderGantt(container) {
     <button class="btn sm" id="g-zoom-fit">全体表示</button>
     ${editable ? '<button class="btn sm" id="g-baseline" title="現在の日程を基準線として保存">📏 基準線保存</button>' : ''}
     ${State.baseline && Object.keys(State.baseline).length ? '<span class="tag-chip" title="灰色の細いバーが基準線（保存時点の計画）">基準線表示中</span>' : ''}
+    ${G.edit ? `<span class="g-help" title="バー中央ドラッグ＝日程移動
+左端＝開始日のみ・右端＝期限のみ変更
+左の行を⠿でドラッグ＝並べ替え
+⭢⭠＝階層変更 ／ ＋＝サブタスク追加
+最下段レーンをドラッグ＝新規タスク作成">❓ 操作方法</span>` : ''}
   </div>
   <div class="gantt-wrap" id="gantt-wrap">
     <div style="display:flex;min-width:fit-content">
@@ -545,11 +567,19 @@ function renderGantt(container) {
         </div>
       </div>
     </div>
-  </div>
-  <p style="color:var(--muted);font-size:12px;margin:8px 2px">
-    ${G.edit
-      ? 'バー中央ドラッグ＝日程移動 ／ 左端＝開始日のみ・右端＝期限のみ変更 ／ 左の行を⠿でドラッグ＝並べ替え ／ ⭢⭠＝階層変更 ／ ＋＝サブタスク追加 ／ 最下段レーンをドラッグ＝新規タスク作成'
-      : 'タスク名・バーのクリックで詳細を開きます。◆ はマイルストーン。'}</p>`;
+  </div>`;
+
+  // ガント領域を画面の高さに収め、ツールバーと横スクロールバーを常に見える位置に固定する
+  const wrapEl = container.querySelector('#gantt-wrap');
+  const fitWrap = () => {
+    if (!wrapEl.isConnected) return;
+    const top = wrapEl.getBoundingClientRect().top;
+    wrapEl.style.height = `${Math.max(240, window.innerHeight - top - 18)}px`;
+  };
+  fitWrap();
+  if (State._ganttFit) window.removeEventListener('resize', State._ganttFit);
+  State._ganttFit = fitWrap;
+  window.addEventListener('resize', State._ganttFit);
 
   container.querySelectorAll('[data-toggle]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -922,14 +952,14 @@ function renderDashboard(container) {
       const cls = U.dueClass(t, smap);
       return `<li data-open="${t.id}">
         ${taskAvatarHtml(t)}
-        <span class="t">${U.esc(t.title)}</span>
+        <span class="t">${U.esc(taskLabel(t))}</span>
         <span class="due ${cls}">${U.fmtDate(t.due_date)}</span></li>`;
     }).join('') || '<div class="empty-note">なし</div>'}</ul></div>`;
   W.mini_board = `<div class="dash-card span8"><h3>簡易ボード</h3>
     <div class="mini-board">${State.statuses.map(st => {
       const stt = tasks.filter(t => t.status_id === st.id);
       return `<div class="mini-col"><h4 style="border-color:${U.esc(st.color)}">${U.esc(st.name)} (${stt.length})</h4>
-        ${stt.slice(0, 5).map(t => `<div class="mini-card" data-open="${t.id}">${U.esc(t.title)}</div>`).join('')}
+        ${stt.slice(0, 5).map(t => `<div class="mini-card" data-open="${t.id}">${U.esc(taskLabel(t))}</div>`).join('')}
         ${stt.length > 5 ? `<div class="mini-more">他 ${stt.length - 5} 件</div>` : ''}</div>`;
     }).join('')}</div></div>`;
   W.activity = `<div class="dash-card span4"><h3>最近のアクティビティ</h3>
@@ -1048,7 +1078,7 @@ async function loadDashboardMetrics(container) {
     rk.classList.remove('empty-note');
     rk.innerHTML = m.risks.length ? `<ul class="deadline-list">${m.risks.slice(0, 8).map(r => `
       <li data-open="${r.id}">
-        <span class="t">${U.esc(r.title)}</span>
+        <span class="t">${U.esc(wbsOf(r.id) ? wbsOf(r.id) + ' ' + r.title : r.title)}</span>
         <span style="color:var(--muted);font-size:12px">${U.esc(r.assignee || '未割当')} / ${r.progress}%</span>
         <span class="due ${r.overdue ? 'overdue' : 'soon'}">${U.esc(r.due.slice(5))}${r.overdue ? ' 超過' : ''}</span>
       </li>`).join('')}</ul>` : '<div class="empty-note">リスクはありません 🎉</div>';
@@ -1147,7 +1177,8 @@ async function renderHome(container) {
 
     <div class="dash-card span7"><h3>自分のタスク（期限順・全プロジェクト横断）</h3>
       <ul class="deadline-list">${ov.my_tasks.map(t => {
-        const cls = !t.due_date ? '' : t.due_date < today ? 'overdue'
+        const cls = (!t.due_date || t.is_done || t.progress >= 100) ? ''
+          : t.due_date < today ? 'overdue'
           : (new Date(t.due_date) - new Date(today)) / DAY <= 3 ? 'soon' : '';
         return `<li data-task="${t.id}" data-proj="${t.project_id}">
           <span class="tag-chip" style="background:${U.esc(t.project_color)}22;border-left:3px solid ${U.esc(t.project_color)}">${U.esc(t.project_name)}</span>
@@ -1269,7 +1300,7 @@ async function renderIssues(container) {
         <div class="issue-recent" data-open="${c.task_id}">
           <div class="meta">${U.avatarHtml(c.author_id ? { name: c.author_name, color: c.author_color } : null)}
             <b>${U.esc(c.author_name || '不明')}</b>
-            <span class="tag-chip">${U.esc(c.task_title)}</span>
+            <span class="tag-chip">${U.esc(wbsOf(c.task_id) ? wbsOf(c.task_id) + ' ' + c.task_title : c.task_title)}</span>
             <span style="color:var(--muted);font-size:11px">${U.esc((c.created_at || '').slice(5, 16))}</span></div>
           <div class="body">${mentionHtml(c.body.length > 120 ? c.body.slice(0, 120) + '…' : c.body)}</div>
         </div>`).join('') || '<div class="empty-note">なし</div>'}
@@ -1433,7 +1464,7 @@ async function renderThread(container) {
     <div class="th-head dash-card">
       <button class="btn sm" id="th-back">← コメント一覧</button>
       <div class="th-task">
-        <div class="th-title">💬 ${U.esc(t.title)}</div>
+        <div class="th-title">💬 ${U.esc(taskLabel(t))}</div>
         <div class="th-sub">
           ${st ? `<span class="badge" style="background:${U.esc(st.color)}">${U.esc(st.name)}</span>` : ''}
           ${U.prioHtml(t.priority)}
@@ -1542,30 +1573,56 @@ function renderCalendar(container) {
   const smap = statusMap();
   const mmap = memberMap();
   const today = U.todayStr();
-  const byDay = {};
-  for (const t of filteredTasks()) {
-    if (t.due_date) (byDay[t.due_date] = byDay[t.due_date] || []).push(t);
-  }
-  const cells = [];
-  const totalCells = Math.ceil((startDow + daysInMonth) / 7) * 7;
-  for (let i = 0; i < totalCells; i++) {
-    const dnum = i - startDow + 1;
-    if (dnum < 1 || dnum > daysInMonth) { cells.push('<div class="cal-cell other"></div>'); continue; }
-    const iso = `${y}-${String(mo + 1).padStart(2, '0')}-${String(dnum).padStart(2, '0')}`;
-    const items = byDay[iso] || [];
-    const dow = i % 7;
-    cells.push(`<div class="cal-cell ${iso === today ? 'today' : ''} ${dow >= 5 ? 'weekend' : ''}">
-      <div class="cal-date">${dnum}</div>
-      ${items.slice(0, 3).map(t => {
-        const st = smap[t.status_id];
-        const done = st && st.is_done;
-        return `<div class="cal-item ${done ? 'done' : ''}" data-open="${t.id}"
-          style="border-left-color:${U.esc(st ? st.color : '#94a3b8')}"
-          title="${U.esc(t.title)} / ${U.esc((mmap[t.assignee_id] || {}).name || '未割当')}">
-          ${t.milestone ? '◆ ' : ''}${U.esc(t.title)}</div>`;
-      }).join('')}
-      ${items.length > 3 ? `<div class="cal-more">他 ${items.length - 3} 件</div>` : ''}
-    </div>`);
+  const isoOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const gridStart = new Date(y, mo, 1 - startDow);
+  const weeks = Math.ceil((startDow + daysInMonth) / 7);
+
+  // 期間つきタスク（Googleカレンダー式に週をまたいで横断バー表示する）
+  const spans = filteredTasks()
+    .filter(t => t.start_date || t.due_date)
+    .map(t => ({ t, s: t.start_date || t.due_date, e: t.due_date || t.start_date }))
+    .sort((a, b) => a.s < b.s ? -1 : a.s > b.s ? 1 : (a.e > b.e ? -1 : 1));
+
+  let weeksHtml = '';
+  for (let w = 0; w < weeks; w++) {
+    const wStart = new Date(gridStart); wStart.setDate(gridStart.getDate() + w * 7);
+    const wsIso = isoOf(wStart);
+    const weIso = isoOf(new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate() + 6));
+    // レーン割当（貪欲法）: 空いている一番上の段に置く
+    const lanes = [];
+    const segs = [];
+    for (const sp of spans) {
+      if (sp.e < wsIso || sp.s > weIso) continue;
+      const sIdx = sp.s <= wsIso ? 0
+        : Math.round((new Date(sp.s + 'T00:00:00') - wStart) / DAY);
+      const eIdx = sp.e >= weIso ? 6
+        : Math.round((new Date(sp.e + 'T00:00:00') - wStart) / DAY);
+      let lane = lanes.findIndex(last => last < sIdx);
+      if (lane === -1) { lane = lanes.length; lanes.push(-1); }
+      lanes[lane] = eIdx;
+      segs.push({ ...sp, sIdx, eIdx, lane, contL: sp.s < wsIso, contR: sp.e > weIso });
+    }
+    const cells = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(wStart.getFullYear(), wStart.getMonth(), wStart.getDate() + i);
+      const dIso = isoOf(d);
+      cells.push(`<div class="cal-cell ${d.getMonth() !== mo ? 'other' : ''} ${dIso === today ? 'today' : ''} ${i >= 5 ? 'weekend' : ''}">
+        <div class="cal-date">${d.getDate() === 1 ? `${d.getMonth() + 1}/1` : d.getDate()}</div></div>`);
+    }
+    const bars = segs.map(sg => {
+      const st = smap[sg.t.status_id];
+      const done = st && st.is_done;
+      const left = sg.sIdx / 7 * 100;
+      const width = (sg.eIdx - sg.sIdx + 1) / 7 * 100;
+      return `<div class="cal-bar ${done ? 'done' : ''} ${sg.contL ? 'contl' : ''} ${sg.contR ? 'contr' : ''}"
+        data-open="${sg.t.id}"
+        style="left:calc(${left}% + 2px);width:calc(${width}% - 5px);top:${26 + sg.lane * 22}px;background:${U.esc(st ? st.color : '#94a3b8')}"
+        title="${U.esc(taskLabel(sg.t))}（${U.esc(sg.s)}〜${U.esc(sg.e)}）/ ${U.esc((mmap[sg.t.assignee_id] || {}).name || sg.t.assignee_label || '未割当')} / ${sg.t.progress}%">
+        ${sg.t.milestone ? '◆ ' : ''}${U.esc(taskLabel(sg.t))}</div>`;
+    }).join('');
+    const h = Math.max(96, 30 + lanes.length * 22 + 6);
+    weeksHtml += `<div class="cal-week" style="min-height:${h}px">${cells.join('')}
+      <div class="cal-bars">${bars}</div></div>`;
   }
   container.innerHTML = `
     <div class="cal-toolbar">
@@ -1574,11 +1631,11 @@ function renderCalendar(container) {
       <button class="btn sm" id="cal-next">→</button>
       <button class="btn sm ghost" id="cal-today">今月</button>
       <span class="spacer"></span>
-      <span style="color:var(--muted);font-size:12px">期限日ベース。◆=マイルストーン。フィルターが効きます</span>
+      <span style="color:var(--muted);font-size:12px">開始日〜期限を横断表示（色=ステータス）。◆=マイルストーン。フィルターが効きます</span>
     </div>
     <div class="cal-grid">
-      ${['月', '火', '水', '木', '金', '土', '日'].map(d => `<div class="cal-dow">${d}</div>`).join('')}
-      ${cells.join('')}
+      <div class="cal-head">${['月', '火', '水', '木', '金', '土', '日'].map(d => `<div class="cal-dow">${d}</div>`).join('')}</div>
+      ${weeksHtml}
     </div>`;
   container.querySelector('#cal-prev').onclick = () => {
     State.calMonth = mo === 0 ? [y - 1, 11] : [y, mo - 1]; renderCalendar(container);

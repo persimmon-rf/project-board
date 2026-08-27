@@ -73,14 +73,8 @@
         <div id="debug-login-box" class="hidden" title="デバッグ: ログインユーザーを完全に切り替えます（セッションごと入れ替え）">
           🔧 <select id="debug-login-user"></select>
         </div>
-        <div class="dropdown" id="export-dd">
-          <button class="btn ghost" id="btn-export">⬇ エクスポート</button>
-          <div class="dropdown-menu">
-            <a id="exp-html" href="#" download>HTMLレポート（アーカイブ用）</a>
-            <a id="exp-xlsx" href="#" download>Excel (.xlsx)</a>
-            <a id="exp-csv" href="#" download>CSV</a>
-            <a id="exp-json" href="#" download>JSON（バックアップ・連携用）</a>
-          </div>
+        <div id="export-dd">
+          <button class="btn ghost" id="btn-export" title="全体出力・ページ単位出力を選べます">⬇ エクスポート</button>
         </div>
         <button class="btn primary" id="btn-new-task">＋ タスク追加</button>
       </div>

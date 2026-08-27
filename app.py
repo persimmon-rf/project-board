@@ -11,10 +11,12 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
+import zipfile
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -121,6 +123,7 @@ CREATE TABLE IF NOT EXISTS members (
     account_type TEXT DEFAULT 'internal',  -- internal / external
     org_role TEXT DEFAULT 'staff',         -- 組織権限: manager / site_admin / professional / staff
     password_hash TEXT,                    -- "salt$sha256"。NULL は初期状態（空パスワードでログイン可）
+    email TEXT,                            -- ログインID（必須運用・小文字で一意）
     active INTEGER DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -323,7 +326,10 @@ def migrate(conn: sqlite3.Connection):
     if "password_hash" not in cols:
         conn.execute("ALTER TABLE members ADD COLUMN password_hash TEXT")
     if "email" not in cols:
-        conn.execute("ALTER TABLE members ADD COLUMN email TEXT")   # SSOヘッダー連携用
+        conn.execute("ALTER TABLE members ADD COLUMN email TEXT")   # ログインID / SSOヘッダー連携用
+    # メールログイン化に伴い、未登録メンバーへダミーメールを補完（毎起動・冪等）
+    conn.execute("UPDATE members SET email='user'||id||'@example.com'"
+                 " WHERE email IS NULL OR email=''")
     t_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
     if "deleted_at" not in t_cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN deleted_at TEXT")       # ゴミ箱（論理削除）
@@ -358,6 +364,9 @@ def migrate(conn: sqlite3.Connection):
         cur = conn.execute("INSERT INTO orgs(name, color, created_at) VALUES(?,?,?)",
                            ("既定の組織", "#4f6ef7", now()))
         conn.execute("UPDATE members SET org_id=? WHERE org_id IS NULL", (cur.lastrowid,))
+    # 親タスク進捗の自動算出を既存データにも適用（毎起動・冪等）
+    for r in conn.execute("SELECT id FROM projects"):
+        recalc_parent_progress(conn, r["id"])
     # project_members が空なら、従来の全員共有の挙動を維持するため
     # 既存の全プロジェクトに全アクティブユーザーをアサインする
     if conn.execute("SELECT COUNT(*) c FROM project_members").fetchone()["c"] == 0:
@@ -401,6 +410,9 @@ def seed_demo(conn: sqlite3.Connection):
     conn.execute("INSERT INTO members(name, role, color, org_id, account_type)"
                  " VALUES(?,?,?,?,?)",
                  ("高橋 健", "エンジニア", "#06b6d4", org2, "external"))
+    # ログインID用のダミーメール（migrate() と同形式）
+    conn.execute("UPDATE members SET email='user'||id||'@example.com'"
+                 " WHERE email IS NULL OR email=''")
 
     cf = json.dumps([
         {"key": "env", "label": "対象環境", "type": "select",
@@ -522,7 +534,7 @@ class MemberIn(BaseModel):
     org_id: Optional[int] = None
     account_type: str = "internal"
     org_role: str = "staff"          # manager / site_admin / professional / staff
-    email: Optional[str] = None      # SSOヘッダー連携用
+    email: str = ""                  # ログインID（必須・一意）。SSOヘッダー連携にも使用
 
 
 class StatusIn(BaseModel):
@@ -865,43 +877,42 @@ def check_role(conn, pid, actor_id, allowed: set, msg: str):
 # ---------------------------------------------------------------- API: auth
 
 class LoginIn(BaseModel):
-    member_id: int
+    email: str
     password: str = ""
 
 
-@app.get("/api/auth/users")
-def auth_users():
-    """ログイン画面用の最小限のユーザー一覧（社内ツール前提）。"""
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT m.id, m.name, m.color, m.account_type, m.org_role,"
-            " (m.password_hash IS NOT NULL) has_password, o.name org_name"
-            " FROM members m LEFT JOIN orgs o ON o.id=m.org_id"
-            " WHERE m.active=1 ORDER BY m.id").fetchall()
-    return rows_to_dicts(rows)
+@app.get("/api/auth/config")
+def auth_config():
+    """ログイン画面用の公開設定（デバッグ機能の有無）。"""
+    return {"debug": DEBUG_FEATURES}
 
 
 @app.post("/api/auth/login")
 def auth_login(body: LoginIn, request: Request, response: Response):
     ip = request.client.host if request.client else ""
     ua = request.headers.get("user-agent", "")[:200]
+    email = body.email.strip().lower()
+    if not email:
+        raise HTTPException(400, "メールアドレスを入力してください")
     with db() as conn:
+        m = conn.execute(
+            "SELECT * FROM members WHERE lower(email)=? AND active=1",
+            (email,)).fetchone()
+        if not m:
+            # 存在有無を悟らせないためパスワード誤りと同じメッセージにする
+            raise HTTPException(401, "メールアドレスまたはパスワードが違います")
         fails = conn.execute(
             "SELECT COUNT(*) c FROM login_logs WHERE member_id=? AND success=0"
             " AND created_at > datetime('now', 'localtime', '-10 minutes')",
-            (body.member_id,)).fetchone()["c"]
+            (m["id"],)).fetchone()["c"]
         if fails >= 5:
             raise HTTPException(429, "ログイン試行が多すぎます。10分後に再試行してください")
-        m = conn.execute("SELECT * FROM members WHERE id=? AND active=1",
-                         (body.member_id,)).fetchone()
-        if not m:
-            raise HTTPException(404, "ユーザーが見つかりません")
         if not verify_password(m["password_hash"], body.password):
             conn.execute(
                 "INSERT INTO login_logs(member_id, name, success, ip, ua, created_at)"
                 " VALUES(?,?,?,?,?,?)", (m["id"], m["name"], 0, ip, ua, now()))
             conn.commit()
-            raise HTTPException(401, "パスワードが違います")
+            raise HTTPException(401, "メールアドレスまたはパスワードが違います")
         conn.execute(
             "INSERT INTO login_logs(member_id, name, success, ip, ua, created_at)"
             " VALUES(?,?,?,?,?,?)", (m["id"], m["name"], 1, ip, ua, now()))
@@ -928,16 +939,23 @@ def auth_logout(request: Request, response: Response):
 @app.post("/api/auth/debug-login")
 def auth_debug_login(body: dict, request: Request, response: Response):
     """開発時専用: ログインユーザーの完全切替（パスワード不要・全ユーザー可）。
-    セッションごと張り替えるため、以後は完全にそのユーザーとして動作する。
+    member_id か name で対象を指定。ログイン画面のデバッグボタンからも使うため
+    未ログインでも呼び出せる。セッションごと張り替えるため、以後は完全に
+    そのユーザーとして動作する。
     ※本番運用では PJBOARD_DEBUG=0 を設定してこの機能を無効化すること。"""
     if not DEBUG_FEATURES:
         raise HTTPException(403, "本番環境ではデバッグ切替は無効化されています")
-    su = CURRENT_USER.get()
-    if su is None:
-        raise HTTPException(401, "ログインが必要です")
     mid = body.get("member_id")
+    name = body.get("name")
     with db() as conn:
-        m = conn.execute("SELECT * FROM members WHERE id=? AND active=1", (mid,)).fetchone()
+        if mid is not None:
+            m = conn.execute("SELECT * FROM members WHERE id=? AND active=1",
+                             (mid,)).fetchone()
+        elif name:
+            m = conn.execute("SELECT * FROM members WHERE name=? AND active=1",
+                             (name,)).fetchone()
+        else:
+            raise HTTPException(400, "member_id か name を指定してください")
         if not m:
             raise HTTPException(404, "ユーザーが見つかりません")
         old_token = request.cookies.get("pjb_session")
@@ -1503,14 +1521,30 @@ def overview(user_id: Optional[int] = None):
 
 # ---------------------------------------------------------------- API: members
 
+def _check_email(conn, email: str, exclude_mid: Optional[int] = None) -> str:
+    """メール必須・重複チェック（小文字化して返す）。"""
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "メールアドレスを入力してください")
+    q = "SELECT id FROM members WHERE lower(email)=?"
+    args: list = [email]
+    if exclude_mid is not None:
+        q += " AND id != ?"
+        args.append(exclude_mid)
+    if conn.execute(q, args).fetchone():
+        raise HTTPException(400, "このメールアドレスは既に使われています")
+    return email
+
+
 @app.post("/api/members")
 def create_member(m: MemberIn):
     check_site_admin()
     with db() as conn:
+        email = _check_email(conn, m.email)
         cur = conn.execute(
             "INSERT INTO members(name, role, color, org_id, account_type, org_role, email)"
             " VALUES(?,?,?,?,?,?,?)",
-            (m.name, m.role, m.color, m.org_id, m.account_type, m.org_role, m.email))
+            (m.name, m.role, m.color, m.org_id, m.account_type, m.org_role, email))
         r = conn.execute("SELECT * FROM members WHERE id=?", (cur.lastrowid,)).fetchone()
     d = dict(r); d.pop("password_hash", None)
     return d
@@ -1525,6 +1559,9 @@ def update_member(mid: int, m: dict):
     if not sets:
         raise HTTPException(400, "no valid fields")
     with db() as conn:
+        if "email" in m:
+            m["email"] = _check_email(conn, m["email"], exclude_mid=mid)
+            vals = [m[k] for k in m if k in allowed] + [mid]
         conn.execute(f"UPDATE members SET {', '.join(sets)} WHERE id=?", vals)
         r = conn.execute("SELECT * FROM members WHERE id=?", (mid,)).fetchone()
     d = dict(r); d.pop("password_hash", None)
@@ -1578,6 +1615,86 @@ def delete_status(sid: int):
 
 # ---------------------------------------------------------------- API: tasks
 
+def _status_maps(conn: sqlite3.Connection, pid: int) -> Optional[dict]:
+    """ステータス⇔進捗連動用の役割マップ。
+    first=先頭（未着手扱い）/ done=完了群 / mid=進行中（名前に「進行」を含む→2番目の未完了）"""
+    sts = conn.execute(
+        "SELECT id, name, is_done FROM statuses WHERE project_id=?"
+        " ORDER BY sort_order, id", (pid,)).fetchall()
+    if not sts:
+        return None
+    first = sts[0]["id"]
+    done = [s["id"] for s in sts if s["is_done"]]
+    mid = next((s["id"] for s in sts if not s["is_done"] and "進行" in s["name"]), None)
+    if mid is None:
+        nd = [s["id"] for s in sts if not s["is_done"] and s["id"] != first]
+        mid = nd[0] if nd else first
+    return {"first": first, "done": done, "mid": mid}
+
+
+def status_for_progress(maps, progress, current_status_id):
+    """進捗の帯（0=未着手 / 1-99=進行中 / 100=完了）に合うステータスを返す。
+    1-99 で既に中間ステータス（レビュー中等）にある場合はそれを尊重する。"""
+    if maps is None:
+        return current_status_id
+    if progress >= 100:
+        return (current_status_id if current_status_id in maps["done"]
+                else (maps["done"][0] if maps["done"] else current_status_id))
+    if progress <= 0:
+        return maps["first"]
+    if (current_status_id and current_status_id != maps["first"]
+            and current_status_id not in maps["done"]):
+        return current_status_id
+    return maps["mid"]
+
+
+def progress_for_status(maps, status_id, current_progress):
+    """ステータス変更に合わせた進捗。完了=100 / 先頭=0 / 中間=（0か100なら）50。"""
+    if maps is None or status_id is None:
+        return current_progress
+    if status_id in maps["done"]:
+        return 100
+    if status_id == maps["first"]:
+        return 0
+    return current_progress if 0 < current_progress < 100 else 50
+
+
+def recalc_parent_progress(conn: sqlite3.Connection, pid: int):
+    """サブタスクを持つタスクの進捗を、子タスク進捗の平均から自動算出して保存する。
+    多階層はボトムアップで再帰計算（葉の値のみが入力）。updated_at は変えない
+    （自動再計算で楽観ロックを壊さないため）。"""
+    rows = conn.execute(
+        "SELECT id, parent_id, progress, status_id FROM tasks"
+        " WHERE project_id=? AND deleted_at IS NULL", (pid,)).fetchall()
+    prog = {r["id"]: r["progress"] or 0 for r in rows}
+    status = {r["id"]: r["status_id"] for r in rows}
+    children: dict = {}
+    for r in rows:
+        children.setdefault(r["parent_id"], []).append(r["id"])
+    memo: dict = {}
+
+    def calc(tid):
+        if tid in memo:
+            return memo[tid]
+        kids = [k for k in children.get(tid, []) if k in prog]
+        v = prog[tid] if not kids else round(sum(calc(k) for k in kids) / len(kids))
+        memo[tid] = v
+        return v
+
+    for tid in prog:
+        calc(tid)
+    maps = _status_maps(conn, pid)
+    for tid, v in memo.items():
+        if not children.get(tid):
+            continue
+        if v != prog[tid]:
+            conn.execute("UPDATE tasks SET progress=? WHERE id=?", (v, tid))
+        # 親のステータスも進捗の帯に合わせる
+        ns = status_for_progress(maps, v, status[tid])
+        if ns != status[tid]:
+            conn.execute("UPDATE tasks SET status_id=? WHERE id=?", (ns, tid))
+
+
 @app.post("/api/projects/{pid}/tasks")
 def create_task(pid: int, t: TaskIn):
     t.actor_id = resolve_uid(t.actor_id)
@@ -1596,6 +1713,9 @@ def create_task(pid: int, t: TaskIn):
                 "SELECT id FROM statuses WHERE project_id=? ORDER BY sort_order LIMIT 1",
                 (pid,)).fetchone()
             status_id = first["id"] if first else None
+            if t.progress:   # 進捗指定つき作成はステータスも帯に合わせる
+                status_id = status_for_progress(_status_maps(conn, pid),
+                                                t.progress, status_id)
         cur = conn.execute(
             "INSERT INTO tasks(project_id, parent_id, title, description, status_id,"
             " assignee_id, assignee_label, priority, start_date, due_date, progress,"
@@ -1612,6 +1732,7 @@ def create_task(pid: int, t: TaskIn):
         if t.assignee_id and t.assignee_id != t.actor_id:
             notify(conn, t.assignee_id, "assign", pid, cur.lastrowid, t.actor_id,
                    f"「{t.title}」の担当になりました")
+        recalc_parent_progress(conn, pid)
         r = conn.execute("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,)).fetchone()
     return task_row_to_dict(r)
 
@@ -1652,6 +1773,24 @@ def update_task(tid: int, patch: TaskPatch):
                                  "リーダーまたは組織の上位者のみ行えます")
             else:
                 raise HTTPException(403, "このプロジェクトの編集権限がありません")
+        # サブタスクを持つタスクの進捗は自動算出のため、直接指定は無視する
+        has_kids = conn.execute(
+            "SELECT 1 FROM tasks WHERE parent_id=? AND deleted_at IS NULL LIMIT 1",
+            (tid,)).fetchone() is not None
+        if "progress" in data and has_kids:
+            data.pop("progress")
+            if not data:
+                return old   # get_task_or_404 は dict を返す
+        # ステータス⇔進捗の連動（片方だけ指定されたとき他方を自動導出）
+        maps = _status_maps(conn, old["project_id"])
+        if "progress" in data and "status_id" not in data:
+            ns = status_for_progress(maps, data["progress"], old["status_id"])
+            if ns != old["status_id"]:
+                data["status_id"] = ns
+        elif "status_id" in data and "progress" not in data and not has_kids:
+            np = progress_for_status(maps, data["status_id"], old["progress"])
+            if np != old["progress"]:
+                data["progress"] = np
         sets, vals = [], []
         for k, v in data.items():
             if k in ("tags", "deps", "custom_values"):
@@ -1736,6 +1875,7 @@ def update_task(tid: int, patch: TaskPatch):
                                     f"{old['title']}（繰り返し）")
                     notify(conn, old["assignee_id"], "system", pid, cur2.lastrowid, None,
                            f"繰り返しタスク「{old['title']}」の次回分を作成しました")
+        recalc_parent_progress(conn, pid)
         r = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
     return task_row_to_dict(r)
 
@@ -1753,6 +1893,7 @@ def delete_task(tid: int, actor_id: Optional[int] = None):
                 raise HTTPException(403, "このタスクを削除する権限がありません")
         record_activity(conn, old["project_id"], None, actor_id, "delete", old["title"])
         conn.execute("UPDATE tasks SET deleted_at=? WHERE id=?", (now(), tid))
+        recalc_parent_progress(conn, old["project_id"])
     return {"ok": True}
 
 
@@ -1768,6 +1909,11 @@ def reorder_tasks(payload: dict):
             else:
                 conn.execute("UPDATE tasks SET sort_order=? WHERE id=?",
                              (it["sort_order"], it["id"]))
+        if items:
+            r = conn.execute("SELECT project_id FROM tasks WHERE id=?",
+                             (items[0]["id"],)).fetchone()
+            if r:
+                recalc_parent_progress(conn, r["project_id"])
     return {"ok": True}
 
 
@@ -1905,6 +2051,58 @@ def check_export_allowed(pid: int):
             raise HTTPException(403, "外部ユーザーのエクスポートはこのプロジェクトでは許可されていません")
 
 
+EXCEL_FONT = "游ゴシック"   # 既定のMS Pゴシックより読みやすいフォントに統一
+
+
+def XFont(**kw):
+    """Excel出力用フォント（名前を游ゴシックに統一）。"""
+    from openpyxl.styles import Font
+    kw.setdefault("name", EXCEL_FONT)
+    return Font(**kw)
+
+
+def _wb_default_font(wb):
+    """ブック既定フォント（index 0）を差し替え、フォント無指定のセルにも効かせる。
+    ※Normalスタイルへの代入では既定セルに反映されない（openpyxl 3.1）。"""
+    try:
+        wb._fonts[0] = XFont(size=11)
+    except Exception:
+        pass
+
+
+def _ignore_number_as_text(ws, sqref: str):
+    """「数値が文字列として保存されています」の警告をセル範囲単位で抑止する。
+    openpyxl は ignoredErrors を書き出せないため、範囲を控えて保存時にXML注入する。"""
+    if not hasattr(ws, "_pjb_ignore"):
+        ws._pjb_ignore = []
+    ws._pjb_ignore.append(sqref)
+
+
+def _save_wb_with_ignores(wb) -> io.BytesIO:
+    """wb.save 後、控えた ignoredErrors をシートXMLへ注入して返す。"""
+    bio = io.BytesIO()
+    wb.save(bio)
+    ignores = {i: getattr(ws, "_pjb_ignore", None)
+               for i, ws in enumerate(wb.worksheets)}
+    if not any(ignores.values()):
+        bio.seek(0)
+        return bio
+    src = zipfile.ZipFile(bio)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            m = re.match(r"xl/worksheets/sheet(\d+)\.xml$", item.filename)
+            if m and ignores.get(int(m.group(1)) - 1):
+                frag = "<ignoredErrors>" + "".join(
+                    f'<ignoredError sqref="{s}" numberStoredAsText="1"/>'
+                    for s in ignores[int(m.group(1)) - 1]) + "</ignoredErrors>"
+                data = data.replace(b"</worksheet>", frag.encode() + b"</worksheet>")
+            z.writestr(item, data)
+    out.seek(0)
+    return out
+
+
 def collect_export_data(pid: int) -> dict:
     check_export_allowed(pid)
     with db() as conn:
@@ -1926,8 +2124,19 @@ def collect_export_data(pid: int) -> dict:
         links = rows_to_dicts(conn.execute(
             "SELECT * FROM task_links WHERE task_id IN"
             " (SELECT id FROM tasks WHERE project_id=?) ORDER BY task_id, id", (pid,)))
+        notes = rows_to_dicts(conn.execute(
+            "SELECT n.*, m.name author_name FROM project_notes n"
+            " LEFT JOIN members m ON m.id=n.updated_by"
+            " WHERE n.project_id=? AND n.deleted_at IS NULL"
+            " ORDER BY n.pinned DESC, n.sort_order, n.id", (pid,)))
+        activities = rows_to_dicts(conn.execute(
+            "SELECT a.*, m.name actor_name, t.title task_title FROM activities a"
+            " LEFT JOIN members m ON m.id=a.actor_id"
+            " LEFT JOIN tasks t ON t.id=a.task_id"
+            " WHERE a.project_id=? ORDER BY a.id", (pid,)))
     return {"project": project, "statuses": statuses, "tasks": tasks,
-            "members": members, "comments": comments, "links": links}
+            "members": members, "comments": comments, "links": links,
+            "notes": notes, "activities": activities}
 
 
 def build_wbs_rows(tasks: list[dict]) -> list[dict]:
@@ -2016,8 +2225,9 @@ def export_xlsx(pid: int):
     wbs_rows = build_wbs_rows(d["tasks"])
 
     wb = Workbook()
+    _wb_default_font(wb)
     head_fill = PatternFill("solid", fgColor="2F4870")
-    head_font = Font(color="FFFFFF", bold=True)
+    head_font = XFont(color="FFFFFF", bold=True)
 
     def style_header(ws, ncols):
         for c in range(1, ncols + 1):
@@ -2048,13 +2258,14 @@ def export_xlsx(pid: int):
     for name, val in rows:
         ws.append([name, val])
     for r in range(1, len(rows) + 1):
-        ws.cell(row=r, column=1).font = Font(bold=True)
+        ws.cell(row=r, column=1).font = XFont(bold=True)
     ws.column_dimensions["A"].width = 16
     ws.column_dimensions["B"].width = 60
     ws.append([])
     ws.append(["ステータス", "件数"])
     for s in d["statuses"]:
         ws.append([s["name"], sum(1 for t in d["tasks"] if t["status_id"] == s["id"])])
+    _ignore_number_as_text(ws, "B1:B30")   # 「12.5%」等の表示用文字列
 
     # --- タスク一覧（WBS）シート
     ws2 = wb.create_sheet("タスク一覧(WBS)")
@@ -2076,6 +2287,8 @@ def export_xlsx(pid: int):
     widths = [8, 6, 40, 12, 14, 8, 12, 12, 8, 8, 8, 5, 18, 50]
     for i, wd in enumerate(widths, 1):
         ws2.column_dimensions[get_column_letter(i)].width = wd
+    if wbs_rows:
+        _ignore_number_as_text(ws2, f"A2:A{1 + len(wbs_rows)}")   # WBS番号 "1.1" 等
 
     # --- コメントシート
     ws3 = wb.create_sheet("コメント")
@@ -2098,14 +2311,341 @@ def export_xlsx(pid: int):
     for col, wd in zip("ABCDE", [8, 32, 10, 30, 60]):
         ws4.column_dimensions[col].width = wd
 
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
+    # --- ノートシート
+    ws5 = wb.create_sheet("ノート")
+    ws5.append(["カテゴリ", "タイトル", "内容", "更新者", "更新日時"])
+    style_header(ws5, 5)
+    for n in d["notes"]:
+        ws5.append([n["category"], n["title"], n["content"],
+                    n.get("author_name") or "-", n["updated_at"] or n["created_at"]])
+    for col, wd in zip("ABCDE", [12, 28, 70, 14, 20]):
+        ws5.column_dimensions[col].width = wd
+
+    bio = _save_wb_with_ignores(wb)
     fname = f"project_{pid}_{date.today().isoformat()}.xlsx"
     return StreamingResponse(
         bio,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# ---------------------------------------------------------------- ビュー別 Excel
+
+def _hex6(color, default="7C8DB5") -> str:
+    c = str(color or "").lstrip("#")
+    return c.upper() if len(c) == 6 else default
+
+
+def _tint(hex6: str, ratio: float = 0.65) -> str:
+    """白と混ぜて薄くした色（ratio=白の割合）。"""
+    r, g, b = (int(hex6[i:i + 2], 16) for i in (0, 2, 4))
+    return "".join(f"{int(v + (255 - v) * ratio):02X}" for v in (r, g, b))
+
+
+def _assignee_hex(t, members_by_id, colors) -> str:
+    if t.get("assignee_id"):
+        m = members_by_id.get(t["assignee_id"])
+        return _hex6(colors.get(f"u:{t['assignee_id']}")
+                     or (m["color"] if m else None), "94A3B8")
+    if t.get("assignee_label"):
+        return _hex6(colors.get(f"v:{t['assignee_label']}") or "64748B", "64748B")
+    return "94A3B8"
+
+
+@app.post("/api/projects/{pid}/export/view.xlsx")
+def export_view_xlsx(pid: int, body: dict):
+    """画面単位のExcel出力（Web表示に近い見た目）。
+    body: {view: table|wbs|board|calendar, ids?: 表示中タスクID（フィルタ反映）,
+           colors?: 担当者色の上書きマップ, month?: [年, 月(0始まり)]}"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    view = body.get("view")
+    if view not in ("table", "wbs", "board", "calendar"):
+        raise HTTPException(400, "view は table / wbs / board / calendar を指定してください")
+    colors = body.get("colors") or {}
+    d = collect_export_data(pid)
+    if body.get("ids"):
+        keep = set(body["ids"])
+        d["tasks"] = [t for t in d["tasks"] if t["id"] in keep]
+    smap = {s["id"]: s for s in d["statuses"]}
+    members_by_id = {m["id"]: m for m in d["members"]}
+    mname = {m["id"]: m["name"] for m in d["members"]}
+    today = date.today()
+
+    thin = Side(style="thin", color="D8DEEA")
+    grid = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    vcenter = Alignment(vertical="center")
+    head_fill = PatternFill("solid", fgColor="2F4870")
+    head_font = XFont(bold=True, color="FFFFFF")
+
+    wb = Workbook()
+    _wb_default_font(wb)
+    ws = wb.active
+
+    def sfill(hex6):
+        return PatternFill("solid", fgColor=hex6)
+
+    def assignee_disp(t):
+        return mname.get(t["assignee_id"]) or t.get("assignee_label") or ""
+
+    # ---------- WBS / ガント（Excelガントチャート） ----------
+    if view == "wbs":
+        ws.title = "WBSガント"
+        rows = build_wbs_rows(d["tasks"])
+        dates = ([t["start_date"] for t in rows if t["start_date"]] +
+                 [t["due_date"] for t in rows if t["due_date"]])
+        pr = d["project"]
+        if pr.get("start_date"):
+            dates.append(pr["start_date"])
+        if pr.get("end_date"):
+            dates.append(pr["end_date"])
+        if dates:
+            d0 = datetime.strptime(min(dates), "%Y-%m-%d").date()
+            d1 = datetime.strptime(max(dates), "%Y-%m-%d").date()
+            ndays = min((d1 - d0).days + 1, 400)
+        else:
+            d0, ndays = today, 0
+        days = [d0 + timedelta(days=i) for i in range(ndays)]
+        LEFT = ["WBS", "タスク名", "担当", "開始", "期限", "進捗"]
+        NL = len(LEFT)
+        # ヘッダー3段（月 / 日 / 曜日）
+        for ci, label in enumerate(LEFT, 1):
+            c = ws.cell(row=1, column=ci, value=label)
+            c.fill, c.font, c.alignment, c.border = head_fill, head_font, center, grid
+            ws.merge_cells(start_row=1, start_column=ci, end_row=3, end_column=ci)
+        wd_jp = "月火水木金土日"
+        month_start = 0
+        for i, dt in enumerate(days):
+            col = NL + 1 + i
+            if i == 0 or dt.day == 1:
+                if i > 0:
+                    ws.merge_cells(start_row=1, start_column=NL + 1 + month_start,
+                                   end_row=1, end_column=col - 1)
+                mc = ws.cell(row=1, column=col, value=f"{dt.year}年{dt.month}月")
+                mc.fill, mc.font, mc.alignment = head_fill, head_font, Alignment(horizontal="left", vertical="center")
+                month_start = i
+            dc = ws.cell(row=2, column=col, value=dt.day)
+            wc = ws.cell(row=3, column=col, value=wd_jp[dt.weekday()])
+            for c in (dc, wc):
+                c.alignment, c.border = center, grid
+                c.font = XFont(size=8, color="FFFFFF" if dt == today else
+                              ("D04545" if dt.weekday() >= 5 else "475569"))
+                if dt == today:
+                    c.fill = sfill("E05252")
+                elif dt.weekday() >= 5:
+                    c.fill = sfill("EFF1F7")
+                else:
+                    c.fill = sfill("F8FAFC")
+            ws.column_dimensions[get_column_letter(col)].width = 3.0
+        if days:
+            ws.merge_cells(start_row=1, start_column=NL + 1 + month_start,
+                           end_row=1, end_column=NL + len(days))
+        for ci, w in enumerate([7, 38, 12, 11, 11, 7], 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        # 明細行
+        parents = {t["parent_id"] for t in d["tasks"] if t["parent_id"]}
+        for ri, t in enumerate(rows, 4):
+            is_parent = t["id"] in parents
+            vals = [t["wbs"], ("　" * t["depth"]) + ("◆ " if t["milestone"] else "") + t["title"],
+                    assignee_disp(t) or "—", t["start_date"] or "", t["due_date"] or "",
+                    (t["progress"] or 0) / 100]
+            for ci, v in enumerate(vals, 1):
+                c = ws.cell(row=ri, column=ci, value=v)
+                c.border = grid
+                c.alignment = vcenter if ci == 2 else center
+                if ci == 6:
+                    c.number_format = "0%"    # 数値として書き込み（文字列警告を出さない）
+                if is_parent:
+                    c.font = XFont(bold=True)
+                    c.fill = sfill("EEF1F7")
+                elif ci == 3 and (t["assignee_id"] or t.get("assignee_label")):
+                    # 担当セルは画面同様に担当者色（淡色）で塗る
+                    c.fill = sfill(_tint(_assignee_hex(t, members_by_id, colors), 0.72))
+            ws.row_dimensions[ri].height = 18
+            # 日付グリッド（週末シェード＋今日列＋バー）
+            s = t["start_date"] or t["due_date"]
+            e = t["due_date"] or t["start_date"]
+            si = ei = None
+            if s and days:
+                sd = max(datetime.strptime(s, "%Y-%m-%d").date(), d0)
+                ed = min(datetime.strptime(e, "%Y-%m-%d").date(), days[-1])
+                if ed >= d0 and sd <= days[-1]:
+                    si, ei = (sd - d0).days, (ed - d0).days
+            bar_hex = "8B95A7" if is_parent else _assignee_hex(t, members_by_id, colors)
+            done_cells = 0
+            if si is not None:
+                done_cells = round((ei - si + 1) * (t["progress"] or 0) / 100)
+            for i, dt in enumerate(days):
+                c = ws.cell(row=ri, column=NL + 1 + i)
+                c.border = grid
+                if t["milestone"] and e and dt.isoformat() == e:
+                    c.value = "◆"
+                    c.font = XFont(color="A855F7", bold=True)
+                    c.alignment = center
+                elif si is not None and si <= i <= ei:
+                    # 進捗分は濃色・残りは淡色（Web のバー＋fill 表現に対応）
+                    c.fill = sfill(bar_hex if i - si < done_cells else _tint(bar_hex, 0.62))
+                elif dt == today:
+                    c.fill = sfill("FDEAEA")
+                elif dt.weekday() >= 5:
+                    c.fill = sfill("F1F3F9")
+        ws.freeze_panes = f"{get_column_letter(NL + 1)}4"
+        if rows:
+            _ignore_number_as_text(ws, f"A4:A{3 + len(rows)}")   # WBS番号 "1.1" 等
+
+    # ---------- テーブル ----------
+    elif view == "table":
+        ws.title = "テーブル"
+        cf_defs = d["project"].get("custom_fields") or []
+        headers = ["WBS", "タスク名", "ステータス", "担当者", "優先度", "開始", "期限",
+                   "進捗", "見積h", "実績h", "タグ"] + [f["label"] for f in cf_defs]
+        for ci, hcell in enumerate(headers, 1):
+            c = ws.cell(row=1, column=ci, value=hcell)
+            c.fill, c.font, c.border, c.alignment = head_fill, head_font, grid, center
+        rows = build_wbs_rows(d["tasks"])
+        parents = {t["parent_id"] for t in d["tasks"] if t["parent_id"]}
+        for ri, t in enumerate(rows, 2):
+            st = smap.get(t["status_id"], {})
+            done = bool(st.get("is_done"))
+            vals = [t["wbs"], ("　" * t["depth"]) + ("◆ " if t["milestone"] else "") + t["title"],
+                    st.get("name", "—"), assignee_disp(t) or "—",
+                    PRIORITY_LABEL.get(t["priority"], t["priority"]),
+                    t["start_date"] or "", t["due_date"] or "", (t["progress"] or 0) / 100,
+                    t["estimate_h"], t["actual_h"], " / ".join(t["tags"])]
+            vals += [t["custom_values"].get(f["key"], "") for f in cf_defs]
+            for ci, v in enumerate(vals, 1):
+                c = ws.cell(row=ri, column=ci, value=v)
+                c.border = grid
+                c.alignment = vcenter if ci in (2, 11) else center
+                if ci == 3 and st:                      # ステータス: 画面のバッジ同様に色付け
+                    c.fill = sfill(_hex6(st.get("color"), "8B95A7"))
+                    c.font = XFont(color="FFFFFF", bold=True, size=10)
+                if ci == 4 and (t["assignee_id"] or t.get("assignee_label")):
+                    c.fill = sfill(_tint(_assignee_hex(t, members_by_id, colors), 0.75))
+                if ci == 7 and t["due_date"] and not done and (t["progress"] or 0) < 100 \
+                        and t["due_date"] < today.isoformat():
+                    c.font = XFont(color="DC2626", bold=True)   # 期限超過
+                if ci == 8:
+                    c.number_format = "0%"
+                if t["id"] in parents and ci == 2:
+                    c.font = XFont(bold=True)
+        # 進捗のデータバー（画面のミニバー相当）
+        if len(rows):
+            from openpyxl.formatting.rule import DataBarRule
+            ws.conditional_formatting.add(
+                f"H2:H{len(rows) + 1}",
+                DataBarRule(start_type="num", start_value=0, end_type="num", end_value=1,
+                            color="4F6EF7", showValue=True))
+        for ci, w in enumerate([7, 40, 12, 14, 8, 11, 11, 9, 7, 7, 18], 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.freeze_panes = "A2"
+        if rows:
+            _ignore_number_as_text(ws, f"A2:A{1 + len(rows)}")   # WBS番号 "1.1" 等
+
+    # ---------- ボード（カンバン） ----------
+    elif view == "board":
+        ws.title = "ボード"
+        for ci, s in enumerate(d["statuses"], 1):
+            col_tasks = [t for t in d["tasks"] if t["status_id"] == s["id"]]
+            h = ws.cell(row=1, column=ci, value=f"{s['name']}（{len(col_tasks)}）")
+            h.fill = sfill(_hex6(s["color"], "8B95A7"))
+            h.font = XFont(bold=True, color="FFFFFF")
+            h.alignment, h.border = center, grid
+            ws.column_dimensions[get_column_letter(ci)].width = 34
+            for ri, t in enumerate(col_tasks, 2):
+                txt = (("◆ " if t["milestone"] else "") + t["title"] +
+                       f"\n{assignee_disp(t) or '未割当'}"
+                       f"{' / 期限 ' + t['due_date'] if t['due_date'] else ''}"
+                       f" / {t['progress']}%")
+                c = ws.cell(row=ri, column=ci, value=txt)
+                c.alignment = Alignment(wrap_text=True, vertical="top")
+                c.border = grid
+                c.fill = sfill(_tint(_assignee_hex(t, members_by_id, colors), 0.82))
+                ws.row_dimensions[ri].height = max(
+                    ws.row_dimensions[ri].height or 0, 34)
+
+    # ---------- カレンダー（Google式の横断バー） ----------
+    else:
+        ws.title = "カレンダー"
+        ym = body.get("month") or [today.year, today.month - 1]
+        y, mo = int(ym[0]), int(ym[1]) + 1
+        first = date(y, mo, 1)
+        start_dow = first.weekday()               # 月曜=0
+        days_in_month = (date(y + (mo == 12), mo % 12 + 1, 1) - timedelta(days=1)).day
+        grid_start = first - timedelta(days=start_dow)
+        n_weeks = -(-(start_dow + days_in_month) // 7)
+        ws.cell(row=1, column=1, value=f"{y}年 {mo}月")
+        ws.cell(row=1, column=1).font = XFont(bold=True, size=14)
+        for ci, wd in enumerate("月火水木金土日", 1):
+            c = ws.cell(row=2, column=ci, value=wd)
+            c.fill, c.font, c.alignment, c.border = head_fill, head_font, center, grid
+            ws.column_dimensions[get_column_letter(ci)].width = 22
+        spans = []
+        for t in d["tasks"]:
+            s = t["start_date"] or t["due_date"]
+            e = t["due_date"] or t["start_date"]
+            if s:
+                spans.append((s, e, t))
+        spans.sort(key=lambda x: (x[0], x[1]))
+        r = 3
+        for w in range(n_weeks):
+            ws_d = grid_start + timedelta(days=w * 7)
+            we_d = ws_d + timedelta(days=6)
+            # 日付行
+            for i in range(7):
+                dt = ws_d + timedelta(days=i)
+                c = ws.cell(row=r, column=i + 1, value=dt.day)
+                c.border = grid
+                c.alignment = Alignment(horizontal="right", vertical="top")
+                if dt == today:
+                    c.fill = sfill("EEF3FF")
+                    c.font = XFont(bold=True, color="4F6EF7")
+                elif dt.month != mo:
+                    c.font = XFont(color="B6BFCF")
+                elif i >= 5:
+                    c.fill = sfill("FAFBFE")
+            # レーン割当（貪欲法）→ 横結合セルのバー
+            lanes: list = []
+            segs = []
+            for s, e, t in spans:
+                sd = datetime.strptime(s, "%Y-%m-%d").date()
+                ed = datetime.strptime(e, "%Y-%m-%d").date()
+                if ed < ws_d or sd > we_d:
+                    continue
+                si = 0 if sd <= ws_d else (sd - ws_d).days
+                ei = 6 if ed >= we_d else (ed - ws_d).days
+                lane = next((i for i, last in enumerate(lanes) if last < si), None)
+                if lane is None:
+                    lane = len(lanes)
+                    lanes.append(-1)
+                lanes[lane] = ei
+                segs.append((lane, si, ei, t))
+            for lane, si, ei, t in segs:
+                rr = r + 1 + lane
+                st = smap.get(t["status_id"], {})
+                if ei > si:
+                    ws.merge_cells(start_row=rr, start_column=si + 1,
+                                   end_row=rr, end_column=ei + 1)
+                c = ws.cell(row=rr, column=si + 1,
+                            value=("◆ " if t["milestone"] else "") + t["title"])
+                c.fill = sfill(_hex6(st.get("color"), "8B95A7"))
+                c.font = XFont(color="FFFFFF", size=9,
+                              strike=bool(st.get("is_done")))
+                c.alignment = Alignment(vertical="center")
+                for cc in range(si + 1, ei + 2):
+                    ws.cell(row=rr, column=cc).border = grid
+                ws.row_dimensions[rr].height = 15
+            r += 1 + max(len(lanes), 3) + 1   # 日付行＋レーン行＋余白1行
+
+    bio = _save_wb_with_ignores(wb)
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 f'attachment; filename="view_{view}_{pid}.xlsx"'})
 
 
 # ---------------------------------------------------------------- export: HTML
@@ -2166,6 +2706,22 @@ def export_html(pid: int):
             f'<td>{esc(t["start_date"] or "-")}</td><td>{esc(t["due_date"] or "-")}</td>'
             f'<td><div class="pbar"><div style="width:{t["progress"]}%"></div></div>'
             f'{t["progress"]}%</td></tr>')
+
+    notes_sections = ""
+    for n in d["notes"]:
+        notes_sections += (
+            f'<details open><summary>{"📌 " if n["pinned"] else ""}'
+            f'[{esc(n["category"])}] {esc(n["title"])}'
+            f'<span class="meta">（{esc(n.get("author_name") or "-")} / '
+            f'{esc((n["updated_at"] or n["created_at"] or "")[:10])}）</span></summary>'
+            f'<p class="desc">{esc(n["content"])}</p></details>')
+
+    act_rows = "".join(
+        f'<tr><td>{esc((a["created_at"] or "")[:16])}</td>'
+        f'<td>{esc(a.get("actor_name") or "システム")}</td>'
+        f'<td>{esc(a["action"])}</td>'
+        f'<td>{esc(a.get("task_title") or "")}</td><td>{esc(a["detail"])}</td></tr>'
+        for a in d["activities"])
 
     detail_sections = ""
     for t in wbs_rows:
@@ -2229,6 +2785,11 @@ summary{{cursor:pointer;font-weight:600}}
 <th>優先度</th><th>開始</th><th>期限</th><th>進捗</th></tr></thead>
 <tbody>{table_rows}</tbody></table>
 <h2>タスク詳細・議論ログ</h2>{detail_sections}
+<h2>ノート</h2>{notes_sections or '<p class="meta">なし</p>'}
+<h2>アクティビティ履歴（全 {len(d["activities"])} 件）</h2>
+<details><summary>履歴を開く</summary>
+<table><thead><tr><th>日時</th><th>操作者</th><th>操作</th><th>タスク</th><th>内容</th></tr></thead>
+<tbody>{act_rows}</tbody></table></details>
 <p class="meta" style="margin-top:40px">Generated by PJ Board</p>
 </div></body></html>"""
     fname = f"report_{pid}_{today}.html"
@@ -2577,6 +3138,7 @@ def restore_task(tid: int, body: dict):
         conn.execute("UPDATE tasks SET deleted_at=NULL WHERE id=?", (tid,))
         record_activity(conn, r["project_id"], tid, body.get("actor_id"),
                         "create", f"{r['title']}（ゴミ箱から復元）")
+        recalc_parent_progress(conn, r["project_id"])
     return {"ok": True}
 
 
@@ -2650,6 +3212,7 @@ def import_tasks(pid: int, body: dict):
                 wbs_to_id[wbs] = cur.lastrowid
             created += 1
         record_activity(conn, pid, None, actor, "create", f"CSVインポート {created} 件")
+        recalc_parent_progress(conn, pid)
     return {"created": created}
 
 

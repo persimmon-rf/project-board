@@ -20,10 +20,10 @@ const API = {
   patch: (u, b) => API._req('PATCH', u, b),
   del: (u) => API._req('DELETE', u),
 
-  authUsers: () => API.get('/api/auth/users'),
-  login: (member_id, password) => API.post('/api/auth/login', { member_id, password }),
+  authConfig: () => API.get('/api/auth/config'),
+  login: (email, password) => API.post('/api/auth/login', { email, password }),
   logout: () => API.post('/api/auth/logout', {}),
-  debugLogin: (member_id) => API.post('/api/auth/debug-login', { member_id }),
+  debugLogin: (body) => API.post('/api/auth/debug-login', body),
   me: () => API.get('/api/auth/me'),
   changePassword: (current_password, new_password) =>
     API.post('/api/auth/password', { current_password, new_password }),
@@ -152,6 +152,7 @@ const U = {
     if (!t.due_date) return '';
     const st = statusMap && statusMap[t.status_id];
     if (st && st.is_done) return '';
+    if (t.progress >= 100) return '';   // 進捗100%は完了扱い（期限色を付けない）
     const today = U.todayStr();
     if (t.due_date < today) return 'overdue';
     const diff = (new Date(t.due_date) - new Date(today)) / 86400000;
