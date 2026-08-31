@@ -4857,6 +4857,9 @@ def project_metrics(pid: int):
         done_ids = {s["id"] for s in statuses if s["is_done"]}
         tasks = [task_row_to_dict(r) for r in conn.execute(
             "SELECT * FROM tasks WHERE project_id=? AND deleted_at IS NULL", (pid,))]
+        # 親タスク（サブタスクあり）は自動集計値のため、メトリクスからは除外して実作業のみ数える
+        parent_ids = {t["parent_id"] for t in tasks if t["parent_id"]}
+        tasks = [t for t in tasks if t["id"] not in parent_ids]
         # バーンダウン: 直近30日の「完了へ遷移」アクティビティから残数推移を復元
         events = {}
         for a in conn.execute(

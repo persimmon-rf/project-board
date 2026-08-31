@@ -942,7 +942,9 @@ async function saveDashLayout(items) {
 }
 
 function renderDashboard(container) {
-  const tasks = State.tasks;
+  // 親タスク（サブタスクあり）は進捗・ステータスが自動算出のため、
+  // ダッシュボードの集計・一覧（残タスク・簡易ボード等）には実作業タスクのみを使う
+  const tasks = State.tasks.filter(t => !hasChildren(t.id));
   const smap = statusMap();
   const today = U.todayStr();
   const total = tasks.length;
@@ -997,7 +999,7 @@ function renderDashboard(container) {
   // ---- ウィジェット定義（id → HTML）
   const W = {};
   W.stat_total = `<div class="dash-card span3 clickable" data-go="" title="クリックで全タスクの一覧へ">
-    <h3>タスク総数</h3><div class="stat-num">${total}</div><div class="stat-sub">クリックで一覧表示</div></div>`;
+    <h3>タスク総数</h3><div class="stat-num">${total}</div><div class="stat-sub">実作業タスク（親を除く）・クリックで一覧</div></div>`;
   W.stat_done = `<div class="dash-card span3 clickable" data-go="done" title="クリックで完了タスクの一覧へ">
     <h3>完了</h3><div class="stat-num green">${done}</div>
     <div class="stat-sub">${total ? Math.round(done / total * 100) : 0}% 完了・クリックで一覧</div></div>`;

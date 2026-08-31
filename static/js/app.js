@@ -567,9 +567,12 @@ function renderSidebar() {
     li.onclick = async () => {
       await loadProject(Number(li.dataset.pid));
       State.ganttCollapsed.clear();
-      // プロジェクトに紐づかない画面（ホーム・組織管理・設定・議論）からはボードへ遷移
-      if (['home', 'admin', 'settings', 'thread'].includes(State.view)) {
-        State.view = 'board';
+      // プロジェクトに紐づかない画面（ホーム・管理画面・ユーザー設定・PJ設定・議論）からは
+      // そのプロジェクトのビューへ遷移する
+      if (['home', 'manage', 'admin', 'mysettings', 'settings', 'thread'].includes(State.view)) {
+        const last = localStorage.getItem('pjboard.view');
+        State.view = ['dashboard', 'board', 'table', 'gantt', 'calendar', 'qa', 'kadai']
+          .includes(last) ? last : 'board';
       }
       render();
     };
