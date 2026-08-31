@@ -250,6 +250,295 @@ def test_view_xlsx_export():
     logout()
 
 
+def test_user_prefs_and_webhook_test():
+    login(1)
+    client.post("/api/prefs", json={"user_id": 1, "key": "theme", "value": "dark"},
+                headers=H)
+    assert client.get("/api/prefs?user_id=1").json()["theme"] == "dark"
+    # 通知転送設定があってもアプリ内通知（担当割当）は正常に動く
+    client.post("/api/prefs", json={"user_id": 3, "key": "notify_webhook",
+                "value": {"enabled": True, "url": "https://invalid.example/hook",
+                          "events": ["assign"]}}, headers=H)
+    t = client.post("/api/projects/1/tasks",
+                    json={"title": "通知転送テスト", "assignee_id": 3, "actor_id": 1},
+                    headers=H)
+    assert t.status_code == 200
+    # テスト送信は https 以外を 400 で弾く
+    r = client.post("/api/me/webhook-test", json={"url": "http://example.com"}, headers=H)
+    assert r.status_code == 400
+    logout()
+
+
+def test_webhook_provider_and_payload():
+    d = appmod.detect_webhook_provider
+    assert d("https://hooks.slack.com/services/T00/B00/xxx") == "slack"
+    assert d("https://chat.googleapis.com/v1/spaces/AAA/messages?key=k") == "googlechat"
+    assert d("https://discord.com/api/webhooks/123/abc") == "discord"
+    assert d("https://discordapp.com/api/webhooks/123/abc") == "discord"
+    assert d("https://contoso.webhook.office.com/webhookb2/xxx") == "teams"
+    assert d("https://prod-01.japaneast.logic.azure.com/workflows/xxx") == "teams"
+    assert d("https://example.com/hook") == "text"
+    assert appmod.webhook_payload("slack", "hi") == {"text": "hi"}
+    assert appmod.webhook_payload("googlechat", "hi") == {"text": "hi"}
+    assert appmod.webhook_payload("discord", "hi") == {"content": "hi"}
+    card = appmod.webhook_payload("teams", "hi")
+    assert card["type"] == "message"
+    assert card["attachments"][0]["content"]["body"][0]["text"] == "hi"
+
+
+def test_qa_crud_and_export():
+    login(1)
+    r = client.post("/api/projects/1/qa",
+                    json={"title": "検証環境のIPアドレスは？", "question": "接続先の確認",
+                          "category": "環境", "asker_name": "顧客A", "assignee_id": 3,
+                          "due_date": "2099-01-01", "actor_id": 1}, headers=H)
+    assert r.status_code == 200
+    qa = r.json()
+    assert qa["seq"] == 1 and qa["status"] == "open"
+    # 回答を書くと自動で「回答済み」＋回答日が入る。決定事項・備考も保存できる
+    d = client.patch(f"/api/qa/{qa['id']}",
+                     json={"answer": "10.0.0.5 です", "decision": "10.0.0.5 で確定",
+                           "note": "次回定例で共有", "actor_id": 1}, headers=H).json()
+    assert d["status"] == "answered" and d["answered_at"]
+    assert d["decision"] == "10.0.0.5 で確定" and d["note"] == "次回定例で共有"
+    assert any(x["id"] == qa["id"] for x in client.get("/api/projects/1/qa").json())
+    # QA管理表Excel（ビュー単位）と全体ExcelのQAシート
+    r = client.post("/api/projects/1/export/view.xlsx", json={"view": "qa"}, headers=H)
+    assert r.status_code == 200 and len(r.content) > 2000
+    import io as _io
+    from openpyxl import load_workbook
+    wb = load_workbook(_io.BytesIO(client.get("/api/projects/1/export.xlsx").content))
+    assert "QA" in wb.sheetnames
+    # アーカイブHTMLにもQAセクション
+    assert "QA（全" in client.get("/api/projects/1/export.html").text
+    # 削除（管理者のみ）
+    assert client.delete(f"/api/qa/{qa['id']}?actor_id=1", headers=H).status_code == 200
+    logout()
+
+
+def test_excel_roundtrip_import():
+    """出力→顧客が記入→取込 の往復（QA: No突合 / タスク: ID突合）。"""
+    import io as _io
+    from openpyxl import load_workbook
+    login(1)
+    # --- QA: 回答を記入して取込（自動で回答済み）＋ No空行の新規追加
+    qa = client.post("/api/projects/1/qa",
+                     json={"title": "往復テスト質問", "asker_name": "顧客", "actor_id": 1},
+                     headers=H).json()
+    wb = load_workbook(_io.BytesIO(client.post(
+        "/api/projects/1/export/view.xlsx", json={"view": "qa"}, headers=H).content))
+    ws = wb.active
+    for row in ws.iter_rows(min_row=5):
+        if row[0].value == qa["seq"]:
+            row[8].value = "回答しました（Excel経由）"
+            row[10].value = "Excelで決定した内容"     # 決定事項列
+    nr = ws.max_row + 1
+    ws.cell(row=nr, column=3, value="Excelで追加した質問\n詳細です")
+    ws.cell(row=nr, column=4, value="顧客B")
+    bio = _io.BytesIO()
+    wb.save(bio)
+    d = client.post("/api/projects/1/import/xlsx?kind=qa&actor_id=1",
+                    content=bio.getvalue(), headers=H).json()
+    assert d["updated"] >= 1 and d["created"] == 1
+    lst = client.get("/api/projects/1/qa").json()
+    got = next(x for x in lst if x["id"] == qa["id"])
+    assert got["answer"].startswith("回答しました") and got["status"] == "answered"
+    assert got["decision"] == "Excelで決定した内容"
+    assert any(x["title"] == "Excelで追加した質問" and x["question"] == "詳細です"
+               for x in lst)
+    for x in lst:
+        if x["title"] in ("往復テスト質問", "Excelで追加した質問"):
+            client.delete(f"/api/qa/{x['id']}?actor_id=1", headers=H)
+
+    # --- タスク: テーブルExcelの進捗を書き換えて取込 → ステータスも連動
+    data0 = client.get("/api/projects/1/data").json()
+    kids = {t["parent_id"] for t in data0["tasks"] if t["parent_id"]}
+    leaf = next(t for t in data0["tasks"]
+                if t["id"] not in kids and 0 < t["progress"] < 100 or
+                (t["id"] not in kids and t["progress"] == 0))
+    wb = load_workbook(_io.BytesIO(client.post(
+        "/api/projects/1/export/view.xlsx", json={"view": "table"}, headers=H).content))
+    ws = wb.active
+    for row in ws.iter_rows(min_row=2):
+        if row[0].value == leaf["id"]:
+            row[8].value = 0.77   # 進捗77%（パーセント書式の値）
+    bio = _io.BytesIO()
+    wb.save(bio)
+    d = client.post("/api/projects/1/import/xlsx?kind=tasks&actor_id=1",
+                    content=bio.getvalue(), headers=H).json()
+    assert d["updated"] >= 1
+    d1 = client.get("/api/projects/1/data").json()
+    t2 = next(t for t in d1["tasks"] if t["id"] == leaf["id"])
+    smap = {s["id"]: s for s in d1["statuses"]}
+    assert t2["progress"] == 77
+    assert not smap[t2["status_id"]]["is_done"]     # 1-99 → 進行中系に連動
+    # 元に戻す
+    client.patch(f"/api/tasks/{leaf['id']}",
+                 json={"progress": leaf["progress"], "actor_id": 1}, headers=H)
+    logout()
+
+
+def test_qa_thread_and_roundtrip():
+    """QAやり取り履歴: 記録→Excel出力に整形→顧客追記行の差分取込。"""
+    import io as _io
+    from openpyxl import load_workbook
+    login(1)
+    qa = client.post("/api/projects/1/qa",
+                     json={"title": "スレッドテスト", "asker_name": "顧客C", "actor_id": 1},
+                     headers=H).json()
+    c1 = client.post(f"/api/qa/{qa['id']}/comments",
+                     json={"body": "一次回答を送付しました", "actor_id": 1}, headers=H).json()
+    assert c1["member_name"] == "田中 太郎"
+    assert len(client.get(f"/api/qa/{qa['id']}/comments").json()) == 1
+    # 一覧に件数が乗る
+    lst = client.get("/api/projects/1/qa").json()
+    assert next(x for x in lst if x["id"] == qa["id"])["comment_count"] == 1
+    # Excel出力の「やり取り履歴」列（13列目）に整形される
+    wb = load_workbook(_io.BytesIO(client.post(
+        "/api/projects/1/export/view.xlsx", json={"view": "qa"}, headers=H).content))
+    ws = wb.active
+    assert ws.cell(row=4, column=13).value == "やり取り履歴"
+    target = None
+    for row in ws.iter_rows(min_row=5):
+        if row[0].value == qa["seq"]:
+            target = row
+    assert "一次回答を送付しました" in target[12].value
+    assert "田中 太郎" in target[12].value
+    # 顧客がセルに1行追記して返送 → 差分だけ新規記録に
+    target[12].value += "\n[09/02 顧客C] 追加で仕様の確認をお願いします"
+    bio = _io.BytesIO()
+    wb.save(bio)
+    d = client.post("/api/projects/1/import/xlsx?kind=qa&actor_id=1",
+                    content=bio.getvalue(), headers=H).json()
+    assert d["thread_added"] == 1
+    cs = client.get(f"/api/qa/{qa['id']}/comments").json()
+    assert len(cs) == 2
+    assert cs[1]["author_name"] == "顧客C"
+    assert cs[1]["body"] == "追加で仕様の確認をお願いします"
+    # 同じファイルをもう一度取込しても重複しない（冪等）
+    wb2 = load_workbook(_io.BytesIO(client.post(
+        "/api/projects/1/export/view.xlsx", json={"view": "qa"}, headers=H).content))
+    bio2 = _io.BytesIO()
+    wb2.save(bio2)
+    d2 = client.post("/api/projects/1/import/xlsx?kind=qa&actor_id=1",
+                     content=bio2.getvalue(), headers=H).json()
+    assert d2["thread_added"] == 0
+    assert len(client.get(f"/api/qa/{qa['id']}/comments").json()) == 2
+    client.delete(f"/api/qa/{qa['id']}?actor_id=1", headers=H)
+    logout()
+
+
+def test_admin_console_and_external_security():
+    """管理画面API権限＋外部ユーザーの多層防御（アサイン確認・タブ制限・遮断）。"""
+    # 管理画面API: staff は403、manager はOK
+    login(3)
+    assert client.get("/api/admin/projects").status_code == 403
+    assert client.get("/api/admin/analytics").status_code == 403
+    logout()
+    login(1)
+    pjs = client.get("/api/admin/projects").json()
+    assert any(x["project"]["id"] == 1 for x in pjs)
+    ana = client.get("/api/admin/analytics").json()
+    assert "workload" in ana and "externals" in ana and "overdue_tasks" in ana
+    # 外部アサイン: 氏名の確認入力（confirm_name）が無いと400
+    r = client.post("/api/projects/1/members",
+                    json={"member_id": 5, "actor_id": 1}, headers=H)
+    assert r.status_code == 400
+    r = client.post("/api/projects/1/members",
+                    json={"member_id": 5, "confirm_name": "高橋 健", "actor_id": 1},
+                    headers=H)
+    assert r.status_code == 200
+    client.delete("/api/projects/1/members/5", headers=H)
+    # 外部公開設定の変更: プロジェクト名の確認入力（confirm_text）が無いと400
+    cur = client.get("/api/projects/1/data").json()["project"]["settings"]
+    r = client.patch("/api/projects/1?actor_id=1",
+                     json={"settings": {**cur, "external_visible_tabs": ["qa"]}},
+                     headers=H)
+    assert r.status_code == 400
+    r = client.patch("/api/projects/1?actor_id=1",
+                     json={"settings": {**cur, "external_visible_tabs": ["qa"]},
+                           "confirm_text": "社内ポータル刷新"}, headers=H)
+    assert r.status_code == 200
+    logout()
+    # 未アサインの外部（高橋）は全面遮断
+    login(5)
+    assert client.get("/api/projects/1/data").status_code == 403
+    assert client.get("/api/projects/1/qa").status_code == 403
+    assert client.get("/api/projects/1/export.html").status_code == 403
+    logout()
+    # アサイン済みの外部（山田）: 公開タブ=qaのみ → タスクは返らずQAのみ閲覧可
+    login(4)
+    d = client.get("/api/projects/1/data").json()
+    assert d["tasks"] == []
+    assert client.get("/api/projects/1/qa").status_code == 200
+    assert client.get("/api/projects/1/notes").status_code == 403
+    assert client.get("/api/projects/1/metrics").status_code == 403
+    logout()
+    # 後始末: 公開タブを既定（全公開）へ戻す
+    login(1)
+    r = client.patch("/api/projects/1?actor_id=1",
+                     json={"settings": cur, "confirm_text": "社内ポータル刷新"},
+                     headers=H)
+    assert r.status_code == 200
+    logout()
+
+
+def test_issue_management():
+    """課題管理: CRUD・関連タスク・タスク側のオープン課題数・コメント・エクスポート・外部既定非公開。"""
+    login(1)
+    mk = lambda b: client.post("/api/projects/1/tasks",
+                               json={**b, "actor_id": 1}, headers=H).json()
+    t1 = mk({"title": "課題関連タスク1"})
+    t2 = mk({"title": "課題関連タスク2"})
+    r = client.post("/api/projects/1/issues-list",
+                    json={"title": "一覧表示の性能が出ない", "description": "3秒かかる",
+                          "policy": "インデックス追加で対応", "action_plan": "SQL見直し",
+                          "assignee_id": 3, "due_date": "2099-01-01",
+                          "task_ids": [t1["id"], t2["id"]], "actor_id": 1}, headers=H)
+    assert r.status_code == 200
+    iss = r.json()
+    assert iss["seq"] == 1 and iss["status"] == "open"
+    got = next(x for x in client.get("/api/projects/1/issues-list").json()
+               if x["id"] == iss["id"])
+    assert len(got["tasks"]) == 2 and got["assignee_name"] == "鈴木 一郎"
+    # タスク側にオープン課題数が乗る
+    d = client.get("/api/projects/1/data").json()
+    assert next(t for t in d["tasks"] if t["id"] == t1["id"])["issue_count"] == 1
+    # タスク詳細にも関連課題
+    dd = client.get(f"/api/tasks/{t1['id']}/detail").json()
+    assert any(x["id"] == iss["id"] for x in dd["issues"])
+    # コメント
+    c = client.post(f"/api/issues/{iss['id']}/comments",
+                    json={"body": "調査を開始", "actor_id": 1}, headers=H).json()
+    assert c["member_name"] == "田中 太郎"
+    # クローズ → 解決日が自動で入り、タスクの件数から外れる
+    u = client.patch(f"/api/issues/{iss['id']}",
+                     json={"status": "closed", "actor_id": 1}, headers=H).json()
+    assert u["resolved_at"]
+    d = client.get("/api/projects/1/data").json()
+    assert next(t for t in d["tasks"] if t["id"] == t1["id"])["issue_count"] == 0
+    # エクスポート（ビューExcel・全体Excelの課題シート・アーカイブHTML）
+    r = client.post("/api/projects/1/export/view.xlsx",
+                    json={"view": "kadai"}, headers=H)
+    assert r.status_code == 200 and len(r.content) > 2000
+    import io as _io
+    from openpyxl import load_workbook
+    wb = load_workbook(_io.BytesIO(client.get("/api/projects/1/export.xlsx").content))
+    assert "課題" in wb.sheetnames
+    assert "課題（全" in client.get("/api/projects/1/export.html").text
+    logout()
+    # 外部ユーザー（山田・PJ1メンバー）: 課題タブは既定で非公開 → 403
+    login(4)
+    assert client.get("/api/projects/1/issues-list").status_code == 403
+    logout()
+    # 後始末
+    login(1)
+    client.delete(f"/api/issues/{iss['id']}?actor_id=1", headers=H)
+    client.delete(f"/api/tasks/{t1['id']}?actor_id=1", headers=H)
+    client.delete(f"/api/tasks/{t2['id']}?actor_id=1", headers=H)
+    logout()
+
+
 def test_member_email_required_and_unique():
     login(1)
     base = {"name": "メール必須テスト", "role": "", "color": "#111111"}

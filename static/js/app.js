@@ -119,6 +119,17 @@ async function loadPrefs() {
   try {
     State.prefs = await API.getPrefs(State.currentUserId) || {};
   } catch (e) { State.prefs = {}; }
+  applyUserPrefs();
+}
+
+/* ユーザー設定（テーマ・表示密度）を画面へ反映 */
+function applyUserPrefs() {
+  const p = State.prefs || {};
+  const theme = p.theme || 'light';
+  const dark = theme === 'dark' ||
+    (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  document.body.classList.toggle('theme-dark', dark);
+  document.body.classList.toggle('density-compact', p.density === 'compact');
 }
 function taskAvatarHtml(t, extra = '') {
   if (t.assignee_id) return U.avatarHtml(memberMap()[t.assignee_id], extra);
@@ -184,6 +195,7 @@ function toast(msg) {
 }
 
 /* ---------------- 通知センター ---------------- */
+let _lastUnread = null;
 async function refreshNotifications() {
   if (!State.loginUser) return;
   try {
@@ -193,6 +205,17 @@ async function refreshNotifications() {
   const n = State.notifs.unread;
   badge.textContent = n > 99 ? '99+' : String(n);
   badge.classList.toggle('hidden', !n);
+  // デスクトップ通知（ユーザー設定でON・許可済み・未読が増えたときのみ）
+  if (_lastUnread !== null && n > _lastUnread && State.prefs.desktop_notify
+      && 'Notification' in window && Notification.permission === 'granted') {
+    const latest = (State.notifs.items || []).find(x => !x.read);
+    if (latest) {
+      try {
+        new Notification('PJ Board', { body: latest.message, tag: 'pjboard' });
+      } catch (e) { /* noop */ }
+    }
+  }
+  _lastUnread = n;
 }
 
 const NOTIF_ICON = { mention: '💬', assign: '📌', comment: '🗨', status: '🔄',
@@ -372,7 +395,8 @@ function closeModal() {
 /* ---------------- URLハッシュ（ビュー・タスクの共有リンク） ---------------- */
 function currentHash() {
   if (State.view === 'home') return '#/home';
-  if (State.view === 'admin') return '#/admin';
+  if (State.view === 'manage') return '#/manage';
+  if (State.view === 'mysettings') return '#/mysettings';
   if (!State.pid) return '#/';
   if (State.view === 'thread') return `#/p/${State.pid}/thread/${State.threadTaskId || 0}`;
   let h = `#/p/${State.pid}/${State.view}`;
@@ -400,9 +424,16 @@ async function applyHash() {
       render();
       return true;
     }
-    if (location.hash.startsWith('#/admin')) {
+    if (location.hash.startsWith('#/manage') || location.hash.startsWith('#/admin')) {
       if (detailTaskId) closeDetail();
-      State.view = 'admin';
+      State.view = 'manage';
+      if (location.hash.startsWith('#/admin')) State.manageTab = 'org';
+      render();
+      return true;
+    }
+    if (location.hash.startsWith('#/mysettings')) {
+      if (detailTaskId) closeDetail();
+      State.view = 'mysettings';
       render();
       return true;
     }
@@ -417,7 +448,7 @@ async function applyHash() {
       render();
       return true;
     }
-    const m = location.hash.match(/^#\/p\/(\d+)\/(dashboard|board|table|gantt|calendar|issues|notes|settings)(?:\/t\/(\d+))?/);
+    const m = location.hash.match(/^#\/p\/(\d+)\/(dashboard|board|table|gantt|calendar|qa|kadai|issues|notes|settings)(?:\/t\/(\d+))?/);
     if (!m) return false;
     const pid = Number(m[1]);
     if (!State.projects.some(p => p.id === pid)) return false;
@@ -469,10 +500,20 @@ function render() {
   renderSidebar();
   renderTopbar();
   const c = document.getElementById('view-container');
-  const noFilter = ['home', 'admin', 'issues', 'notes', 'settings', 'thread'].includes(State.view);
+  if (State.view === 'admin') { State.view = 'manage'; State.manageTab = 'org'; }
+  // 外部ユーザー: 公開されていないタブに入り込まないようフォールバック
+  if (State.loginUser && State.loginUser.account_type === 'external' && State.project) {
+    const tabs = pset('external_visible_tabs') || [];
+    const projViews = ['dashboard', 'board', 'table', 'gantt', 'calendar', 'qa', 'kadai', 'issues', 'notes'];
+    if (projViews.includes(State.view) && !tabs.includes(State.view)) {
+      State.view = tabs[0] || 'home';
+    }
+  }
+  const noFilter = ['home', 'manage', 'mysettings', 'qa', 'kadai', 'issues', 'notes', 'settings', 'thread'].includes(State.view);
   document.getElementById('filterbar').classList.toggle('hidden', noFilter);
   if (State.view === 'home') { renderHome(c); syncHash(); return; }
-  if (State.view === 'admin') { renderAdminPage(c); syncHash(); return; }
+  if (State.view === 'manage') { renderManagePage(c); syncHash(); return; }
+  if (State.view === 'mysettings') { renderMySettings(c); syncHash(); return; }
   renderFilterOptions();
   if (!State.project) {
     c.innerHTML = '<div class="empty-note">プロジェクトを選択、または「＋」で新規作成してください。</div>';
@@ -486,6 +527,8 @@ function render() {
     case 'table': renderTable(c); break;
     case 'gantt': renderGantt(c); break;
     case 'calendar': renderCalendar(c); break;
+    case 'qa': renderQa(c); break;
+    case 'kadai': renderKadai(c); break;
     case 'issues': renderIssues(c); break;
     case 'notes': renderNotes(c); break;
     case 'settings': renderSettingsPage(c); break;
@@ -497,12 +540,16 @@ function render() {
       n === State.tasks.length ? `${n} 件` : `${n} / ${State.tasks.length} 件`;
   }
   syncHash();
+  // 「初期表示=前回の画面」用に最後に開いた主要ビューを記憶
+  if (['home', 'dashboard', 'board', 'table', 'gantt', 'calendar', 'issues', 'notes'].includes(State.view)) {
+    localStorage.setItem('pjboard.view', State.view);
+  }
 }
 
 function renderSidebar() {
   const imp = isImpersonating();
   document.getElementById('nav-home').classList.toggle('active', State.view === 'home');
-  document.getElementById('nav-org-admin').classList.toggle('active', State.view === 'admin');
+  document.getElementById('nav-org-admin').classList.toggle('active', State.view === 'manage');
   // 表示のみ切替中は「プロジェクト」「プロジェクトメンバー」だけ残す（footerの切替UIは残る）
   document.getElementById('nav-home').closest('.side-section')
     .classList.toggle('hidden', imp);
@@ -562,6 +609,7 @@ function renderSidebar() {
           <div class="lu-name">${U.esc(lu.name)}</div>
           <div class="lu-role">${U.esc(ORG_ROLE_LABEL[lu.org_role] || '一般')}${lu.account_type === 'external' ? ' / 外部' : ''}</div>
         </div>
+        <button class="icon-btn" id="btn-mysettings" title="ユーザー設定（テーマ・通知転送など）">⚙</button>
         <button class="icon-btn" id="btn-password" title="パスワード変更">🔑</button>
         <button class="icon-btn" id="btn-logout" title="ログアウト">🚪</button>
       </div>
@@ -572,6 +620,7 @@ function renderSidebar() {
       location.reload();
     };
     document.getElementById('btn-password').onclick = openPasswordModal;
+    document.getElementById('btn-mysettings').onclick = () => { State.view = 'mysettings'; render(); };
     const un = document.getElementById('btn-unimpersonate');
     if (un) un.onclick = () => switchViewUser(lu.id);
   }
@@ -673,10 +722,11 @@ function openPasswordModal() {
 
 function renderTopbar() {
   const p = State.project;
-  const global = State.view === 'home' || State.view === 'admin';
+  const global = ['home', 'manage', 'mysettings'].includes(State.view);
   document.getElementById('proj-name').textContent =
     State.view === 'home' ? 'マイダッシュボード' :
-    State.view === 'admin' ? '組織・ユーザー管理' :
+    State.view === 'manage' ? '🛠 管理画面' :
+    State.view === 'mysettings' ? 'ユーザー設定' :
     State.view === 'settings' ? `${p ? p.name : ''} — 設定` :
     (p ? p.name : 'プロジェクト未選択');
   document.getElementById('proj-color-dot').style.background =
@@ -690,7 +740,15 @@ function renderTopbar() {
   // イシュー/コメントを閲覧できない外部ユーザーにはイシュータブを隠す
   const issuesTab = document.querySelector('#view-tabs button[data-view="issues"]');
   if (issuesTab) issuesTab.classList.toggle('hidden', !canViewComments());
+  // 外部ユーザー: PJ設定「外部パートナーの公開範囲」で許可されたタブのみ表示
+  const extTabs = (State.loginUser && State.loginUser.account_type === 'external' && p)
+    ? (pset('external_visible_tabs') || []) : null;
   document.querySelectorAll('#view-tabs button').forEach(b => {
+    if (extTabs) {
+      b.classList.toggle('hidden',
+        !extTabs.includes(b.dataset.view) ||
+        (b.dataset.view === 'issues' && !canViewComments()));
+    }
     const v = State.view === 'thread' ? 'issues' : State.view;   // 議論ページ中はコメント一覧タブを点灯
     b.classList.toggle('active', !global && b.dataset.view === v);
   });
@@ -723,6 +781,7 @@ function openExportModal() {
   if (!p) { toast('先にプロジェクトを選択してください'); return; }
   const views = [['table', '📑 テーブル'], ['gantt', '📅 WBS / ガント'],
                  ['board', '📋 ボード'], ['calendar', '📆 カレンダー'],
+                 ['qa', '❓ QA管理表'], ['kadai', '📌 課題管理表'],
                  ['dashboard', '📊 ダッシュボード']];
   const cur = views.some(v => v[0] === State.view) ? State.view : 'table';
   showModal(`
@@ -799,7 +858,8 @@ function exportTableCleanHtml(root) {
 async function exportViewHtml(view) {
   const p = State.project;
   const names = { dashboard: 'ダッシュボード', board: 'ボード', table: 'テーブル',
-                  gantt: 'WBSガント', calendar: 'カレンダー' };
+                  gantt: 'WBSガント', calendar: 'カレンダー', qa: 'QA管理表',
+                  kadai: '課題管理表' };
   const vname = names[view];
   // アプリの実CSSを取り込む（読み込み中の<link>から実URLを取得）
   let css = '';
@@ -817,7 +877,8 @@ async function exportViewHtml(view) {
     off.style.cssText = 'position:absolute;left:-12000px;top:0;width:1400px;background:#fff';
     document.body.appendChild(off);
     ({ dashboard: renderDashboard, board: renderBoard, table: renderTable,
-       gantt: renderGantt, calendar: renderCalendar })[view](off);
+       gantt: renderGantt, calendar: renderCalendar, qa: renderQa,
+       kadai: renderKadai })[view](off);
     await new Promise(r => setTimeout(r, 800));   // 非同期チャートの描画待ち
     root = off;
   }
@@ -831,7 +892,7 @@ async function exportViewHtml(view) {
 /* ===== エクスポート専用の上書き（アプリのレイアウト前提を解除して1枚のページにする） ===== */
 html,body{height:auto!important;overflow:visible!important}
 body{display:block;padding:24px 28px}
-button,.gantt-toolbar,.g-rowtools,.g-grip,.g-tool,.g-resize,.g-resize-l,.dash-toolbar,.cal-more,.board-col-add{display:none!important}
+button,.gantt-toolbar,.g-rowtools,.g-grip,.g-tool,.g-resize,.g-resize-l,.dash-toolbar,.dash-item-tools,.cal-more,.board-col-add{display:none!important}
 *{pointer-events:none!important;user-select:text!important}
 .exp-head{margin-bottom:18px;border-left:6px solid ${U.esc(p.color)};padding-left:12px}
 .exp-head h1{margin:0;font-size:22px}
@@ -863,7 +924,8 @@ button,.gantt-toolbar,.g-rowtools,.g-grip,.g-tool,.g-resize,.g-resize-l,.dash-to
 /* ---------------- ページ単位のExcel出力（サーバー生成） ---------------- */
 async function exportViewXlsx(view) {
   const p = State.project;
-  const names = { board: 'ボード', table: 'テーブル', gantt: 'WBSガント', calendar: 'カレンダー' };
+  const names = { board: 'ボード', table: 'テーブル', gantt: 'WBSガント',
+                  calendar: 'カレンダー', qa: 'QA管理表', kadai: '課題管理表' };
   const res = await fetch(`/api/projects/${p.id}/export/view.xlsx`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' },
@@ -888,6 +950,32 @@ async function exportViewXlsx(view) {
   a.remove();
   URL.revokeObjectURL(a.href);
   toast(`${names[view]}をExcelファイルとして出力しました`);
+}
+
+/* ---------------- Excelインポート（エクスポート→顧客記入→取込の往復運用） ---------------- */
+function importViewXlsx(kind) {
+  const p = State.project;
+  if (!p) { toast('先にプロジェクトを選択してください'); return; }
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.xlsx';
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file) return;
+    try {
+      const res = await fetch(
+        `/api/projects/${p.id}/import/xlsx?kind=${kind}&actor_id=${State.currentUserId}`,
+        { method: 'POST', headers: { 'X-Requested-With': 'fetch' }, body: file });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.detail || `HTTP ${res.status}`);
+      toast(`📥 取込完了: 更新 ${d.updated} 件 ／ 追加 ${d.created} 件`
+        + (d.thread_added ? ` ／ やり取り追記 ${d.thread_added} 件` : '')
+        + (d.skipped ? ` ／ スキップ ${d.skipped} 件` : ''));
+      if (kind !== 'qa') await loadProject(p.id);
+      render();
+    } catch (err) { toast('取込に失敗しました: ' + err.message); }
+  };
+  input.click();
 }
 
 function renderFilterOptions() {
@@ -1138,34 +1226,52 @@ function openUserModal(mid = null, { defaultOrgId = null, onSaved = null } = {})
 }
 
 /* ---------------- modals: プロジェクトへのメンバーアサイン ---------------- */
-function openAssignModal() {
+function openAssignModal(opts = {}) {
   const p = State.project;
   if (!p) { toast('先にプロジェクトを選択してください'); return; }
   const memberIds = new Set(State.members.map(m => m.id));
   const omap = orgMap();
-  const candidates = State.users.filter(u => !memberIds.has(u.id));
+  // このモーダルの候補は社内ユーザーのみ（外部は管理画面の専用フローからのみアサイン可能）
+  const candidates = State.users.filter(
+    u => !memberIds.has(u.id) && u.account_type !== 'external');
+  const extCandidates = State.users.filter(
+    u => !memberIds.has(u.id) && u.account_type === 'external');
+  const showExt = !!opts.externalSection && loginRank() >= 3;
+  const orgName = (u) => (omap[u.org_id] || {}).name || '無所属';
 
-  // 組織ごとにグルーピングして表示
-  const byOrg = new Map();
-  for (const u of candidates) {
-    const key = u.org_id ?? 0;
-    if (!byOrg.has(key)) byOrg.set(key, []);
-    byOrg.get(key).push(u);
-  }
-  const candHtml = candidates.length ? [...byOrg.entries()].map(([oid, users]) => `
-    <div style="margin-bottom:10px">
-      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">
-        🏢 ${U.esc(oid ? (omap[oid] || {}).name || '?' : '無所属')}</div>
-      ${users.map(u => `
+  // Googleカレンダー風: 入力→候補→チップ追加→まとめてアサイン
+  const candHtml = `
+    <div class="ac-box" id="am-ac">
+      <div class="ac-chips" id="am-chips"></div>
+      <input id="am-input" placeholder="👤 名前・組織・メールで検索してメンバーを追加…" autocomplete="off">
+      <div class="ac-drop hidden" id="am-drop"></div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
+      <select id="am-role" title="追加するメンバーのPJロール">
+        <option value="member">メンバーとして</option>
+        <option value="leader">リーダーとして</option>
+        <option value="advisor">ご意見番として</option>
+      </select>
+      <button class="btn primary sm" id="am-add" disabled>アサイン</button>
+      <span class="set-hint" style="margin:0">🔒 外部ユーザーはここからはアサインできません（管理画面 → プロジェクト管理）</span>
+    </div>`;
+
+  const extTabs = pset('external_visible_tabs') || [];
+  const extHtml = showExt ? `
+    <div class="form-row ext-danger-box"><label>🔒 外部パートナーのアサイン（マネージャー／サイト管理者専用）</label>
+      <p class="set-hint" style="margin:2px 0 8px">
+        誤アサイン防止のため<b>氏名の確認入力</b>が必要です。公開タブは現在
+        「${extTabs.map(t => (TAB_LABELS_JS[t] || t)).join('・') || 'なし'}」（PJ設定で変更可）。</p>
+      ${extCandidates.map(u => `
         <div class="status-edit-row">
           ${U.avatarHtml(u)}
           <span style="flex:1">${U.esc(u.name)}
-            <span style="color:var(--muted);font-size:12px">${U.esc(u.role)}
-            ${u.account_type === 'external' ? ' <span class="ext-chip">外部</span>' : ''}</span></span>
-          <button class="btn sm primary" data-assign="${u.id}">アサイン</button>
-        </div>`).join('')}
-    </div>`).join('')
-    : '<div class="empty-note" style="padding:10px">アサイン可能なユーザーはいません（全員アサイン済み）</div>';
+            <span style="color:var(--muted);font-size:12px">${U.esc(orgName(u))}</span>
+            <span class="ext-chip">外部</span></span>
+          <button class="btn sm danger" data-ext-assign="${u.id}">アサイン…</button>
+        </div>`).join('') ||
+        '<div style="color:var(--muted);font-size:12.5px">アサイン可能な外部ユーザーはいません</div>'}
+    </div>` : '';
 
   const pmOf = (mid) => State.projectMembers.find(
     x => x.project_id === p.id && x.member_id === mid) || {};
@@ -1193,10 +1299,10 @@ function openAssignModal() {
             ${roleOpts.map(r =>
               `<option value="${r}" ${pm.role === r ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}
           </select>
-          <label class="chk ext-flag" title="コメントの閲覧・投稿" style="${isExt ? '' : 'display:none'}">
-            <input type="checkbox" data-flag-c="${m.id}" ${pm.can_view_comments ? 'checked' : ''}>💬</label>
-          <label class="chk ext-flag" title="タスク詳細の閲覧" style="${isExt ? '' : 'display:none'}">
-            <input type="checkbox" data-flag-d="${m.id}" ${pm.can_view_detail ? 'checked' : ''}>📄</label>
+          <label class="chk ext-flag" title="コメントの閲覧・投稿${loginRank() < 3 ? '（変更はマネージャー／サイト管理者のみ）' : ''}" style="${isExt ? '' : 'display:none'}">
+            <input type="checkbox" data-flag-c="${m.id}" ${pm.can_view_comments ? 'checked' : ''} ${loginRank() < 3 ? 'disabled' : ''}>💬</label>
+          <label class="chk ext-flag" title="タスク詳細の閲覧${loginRank() < 3 ? '（変更はマネージャー／サイト管理者のみ）' : ''}" style="${isExt ? '' : 'display:none'}">
+            <input type="checkbox" data-flag-d="${m.id}" ${pm.can_view_detail ? 'checked' : ''} ${loginRank() < 3 ? 'disabled' : ''}>📄</label>
           <button class="btn sm danger" data-unassign="${m.id}">外す</button>
         </div>`;
       }).join('') || '<div style="color:var(--muted);font-size:13px">まだメンバーがいません</div>'}
@@ -1211,19 +1317,96 @@ function openAssignModal() {
           <span style="flex:1">${U.esc(l)}</span>
         </div>`).join('')}
     </div>` : ''}
-    <div class="form-row"><label>ユーザーを追加アサイン（外部ユーザーは自動的に「外部」ロール・閲覧制限つき）</label>${candHtml}</div>
+    <div class="form-row"><label>メンバーを追加アサイン（社内ユーザー）</label>${candHtml}</div>
+    ${extHtml}
     <div class="modal-actions">
       <button class="btn left" id="am-new-user">＋ 新規ユーザー作成</button>
       <button class="btn primary" data-close>閉じる</button>
     </div>`);
 
-  document.querySelectorAll('#modal [data-assign]').forEach(btn => {
-    btn.onclick = async () => {
-      await API.assignMember(p.id, { member_id: Number(btn.dataset.assign), actor_id: State.currentUserId });
+  // ---- オートコンプリート（入力→候補→チップ→まとめてアサイン）
+  const pending = [];
+  const acInput = document.getElementById('am-input');
+  const acDrop = document.getElementById('am-drop');
+  const acChips = document.getElementById('am-chips');
+  const addBtn = document.getElementById('am-add');
+  let acIdx = 0;
+  const norm = (s2) => (s2 || '').toLowerCase().replace(/[\s　]/g, '');
+  const acCands = () => {
+    const kw = norm(acInput.value);
+    const pend = new Set(pending.map(u => u.id));
+    return candidates.filter(u => !pend.has(u.id) &&
+      (!kw || norm(u.name).includes(kw) || norm(orgName(u)).includes(kw) ||
+       norm(u.email).includes(kw) || norm(u.role).includes(kw))).slice(0, 8);
+  };
+  const renderChips = () => {
+    acChips.innerHTML = pending.map(u => `
+      <span class="ac-chip">${U.avatarHtml(u, 'sm')}${U.esc(u.name)}
+        <span class="x" data-unpend="${u.id}">✕</span></span>`).join('');
+    acChips.querySelectorAll('[data-unpend]').forEach(x => x.onclick = () => {
+      pending.splice(pending.findIndex(u => u.id === Number(x.dataset.unpend)), 1);
+      renderChips();
+      acInput.focus();
+    });
+    addBtn.disabled = !pending.length;
+    addBtn.textContent = pending.length ? `${pending.length} 名をアサイン` : 'アサイン';
+  };
+  const renderDrop = () => {
+    const list = acCands();
+    acDrop.classList.toggle('hidden', !list.length || document.activeElement !== acInput);
+    acIdx = Math.min(acIdx, Math.max(0, list.length - 1));
+    acDrop.innerHTML = list.map((u, i) => `
+      <div class="ac-item ${i === acIdx ? 'active' : ''}" data-pick="${u.id}">
+        ${U.avatarHtml(u)}
+        <div style="flex:1;min-width:0">
+          <div>${U.esc(u.name)} <span style="color:var(--muted);font-size:11.5px">${U.esc(u.role || '')}</span></div>
+          <div style="color:var(--muted);font-size:11px">🏢 ${U.esc(orgName(u))} ・ ${U.esc(u.email || '')}</div>
+        </div></div>`).join('');
+    acDrop.querySelectorAll('[data-pick]').forEach(el => {
+      el.onmousedown = (e) => {   // blurより先に確定させる
+        e.preventDefault();
+        pick(Number(el.dataset.pick));
+      };
+    });
+  };
+  const pick = (uid) => {
+    const u = candidates.find(x => x.id === uid);
+    if (!u || pending.some(x => x.id === uid)) return;
+    pending.push(u);
+    acInput.value = '';
+    acIdx = 0;
+    renderChips();
+    renderDrop();
+    acInput.focus();
+  };
+  acInput.oninput = () => { acIdx = 0; renderDrop(); };
+  acInput.onfocus = renderDrop;
+  acInput.onblur = () => setTimeout(() => acDrop.classList.add('hidden'), 150);
+  acInput.onkeydown = (e) => {
+    const list = acCands();
+    if (e.key === 'ArrowDown') { acIdx = Math.min(acIdx + 1, list.length - 1); renderDrop(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { acIdx = Math.max(acIdx - 1, 0); renderDrop(); e.preventDefault(); }
+    else if (e.key === 'Enter') { if (list[acIdx]) pick(list[acIdx].id); e.preventDefault(); }
+    else if (e.key === 'Backspace' && !acInput.value && pending.length) { pending.pop(); renderChips(); }
+    else if (e.key === 'Escape') acDrop.classList.add('hidden');
+  };
+  renderChips();
+  addBtn.onclick = async () => {
+    const role = document.getElementById('am-role').value;
+    try {
+      for (const u of pending) {
+        await API.assignMember(p.id, { member_id: u.id, role, actor_id: State.currentUserId });
+      }
+      toast(`${pending.length} 名をアサインしました`);
       await loadBootstrap();
       await refresh();
-      openAssignModal();   // モーダルを開いたまま更新
-    };
+      openAssignModal(opts);   // モーダルを開いたまま更新
+    } catch (err) { toast(err.message); }
+  };
+  // ---- 外部パートナーのアサイン（確認入力つき・管理画面からのみ）
+  document.querySelectorAll('#modal [data-ext-assign]').forEach(btn => {
+    btn.onclick = () => openExternalAssignConfirm(
+      p, State.users.find(u => u.id === Number(btn.dataset.extAssign)), opts);
   });
   document.querySelectorAll('#modal [data-unassign]').forEach(btn => {
     btn.onclick = async () => {
@@ -1272,6 +1455,51 @@ function openAssignModal() {
       toast('表示色を保存しました（自分の画面にのみ反映）');
     };
   });
+}
+
+const TAB_LABELS_JS = { dashboard: 'ダッシュボード', board: 'ボード', table: 'テーブル',
+                        gantt: 'WBSガント', calendar: 'カレンダー', qa: 'QA',
+                        kadai: '課題', issues: 'コメント一覧', notes: 'ノート' };
+
+/* 外部ユーザーのアサイン確認（氏名の完全一致入力を要求。サーバー側でも二重に検証） */
+function openExternalAssignConfirm(p, user, reopenOpts) {
+  if (!user) return;
+  const tabs = (pset('external_visible_tabs') || []).map(t => TAB_LABELS_JS[t] || t);
+  showModal(`
+    <h2>🔒 外部パートナーのアサイン確認</h2>
+    <div class="ext-warn">
+      <b>${U.esc(user.name)}</b>（外部アカウント）をプロジェクト「${U.esc(p.name)}」にアサインしようとしています。
+      アサインすると、このユーザーは以下にアクセスできるようになります。
+    </div>
+    <ul style="font-size:13px;line-height:1.9;margin:10px 0">
+      <li>公開タブ: <b>${tabs.join('・') || 'なし（PJ設定で全タブ非公開）'}</b></li>
+      <li>コメント閲覧: <b>${pset('external_default_view_comments') ? '許可（既定）' : '不可（既定）'}</b> ／
+          タスク詳細閲覧: <b>${pset('external_default_view_detail') ? '許可（既定）' : '不可（既定）'}</b></li>
+      <li>エクスポート: <b>${pset('external_can_export') ? '許可' : '不可'}</b></li>
+    </ul>
+    <div class="form-row"><label>確認のため、アサインする外部ユーザーの氏名「${U.esc(user.name)}」を入力してください</label>
+      <input id="exa-name" placeholder="${U.esc(user.name)}" autocomplete="off"></div>
+    <div class="modal-actions">
+      <button class="btn" id="exa-cancel">キャンセル</button>
+      <button class="btn danger" id="exa-ok" disabled>アサインする</button>
+    </div>`);
+  const inp = document.getElementById('exa-name');
+  const ok = document.getElementById('exa-ok');
+  inp.oninput = () => { ok.disabled = inp.value.trim() !== user.name; };
+  inp.focus();
+  document.getElementById('exa-cancel').onclick = () => openAssignModal(reopenOpts);
+  ok.onclick = async () => {
+    try {
+      await API.assignMember(p.id, {
+        member_id: user.id, confirm_name: inp.value.trim(),
+        actor_id: State.currentUserId,
+      });
+      toast(`外部ユーザー「${user.name}」をアサインしました`);
+      await loadBootstrap();
+      await refresh();
+      openAssignModal(reopenOpts);
+    } catch (err) { toast(err.message); }
+  };
 }
 
 /* ---------------- login ---------------- */
@@ -1336,6 +1564,11 @@ async function init() {
   const savedPid = Number(localStorage.getItem('pjboard.pid'));
   const target = State.projects.find(p => p.id === savedPid) || State.projects[0];
   if (target) await loadProject(target.id);
+  // ユーザー設定「初期表示=前回の画面」: ハッシュ指定がない場合のみ復元
+  if (!location.hash && State.prefs.start_view === 'last') {
+    const lv = localStorage.getItem('pjboard.view');
+    if (lv && (lv === 'home' || State.project)) State.view = lv;
+  }
   // URLハッシュ（共有リンク）があればそのビュー・タスクを復元、無ければホーム
   if (!(await applyHash())) render();
   // 戻る/進む（ブラウザ履歴）→ ハッシュを画面状態に反映。未知のハッシュはホームへ
@@ -1352,7 +1585,7 @@ async function init() {
   });
   // ホーム（プロジェクト横断ダッシュボード）
   document.getElementById('nav-home').onclick = () => { State.view = 'home'; render(); };
-  document.getElementById('nav-org-admin').onclick = () => { State.view = 'admin'; render(); };
+  document.getElementById('nav-org-admin').onclick = () => { State.view = 'manage'; render(); };
   // ボードのグルーピング切替
   document.querySelectorAll('#board-group-toggle button').forEach(b => {
     b.onclick = () => {

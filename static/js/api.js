@@ -129,6 +129,23 @@ const API = {
   weeklySummary: (pid, actor) => API.post(`/api/projects/${pid}/summary`, { actor_id: actor }),
   getPrefs: (uid) => API.get(`/api/prefs?user_id=${uid}`),
   setPref: (uid, key, value) => API.post('/api/prefs', { user_id: uid, key, value }),
+  webhookTest: (url, provider) => API.post('/api/me/webhook-test', { url, provider }),
+  qaList: (pid) => API.get(`/api/projects/${pid}/qa`),
+  qaCreate: (pid, body) => API.post(`/api/projects/${pid}/qa`, body),
+  qaUpdate: (qid, body) => API.patch(`/api/qa/${qid}`, body),
+  qaDelete: (qid, actor) => API.del(`/api/qa/${qid}?actor_id=${actor}`),
+  adminProjects: () => API.get('/api/admin/projects'),
+  adminAnalytics: () => API.get('/api/admin/analytics'),
+  issuesList: (pid) => API.get(`/api/projects/${pid}/issues-list`),
+  issueCreate: (pid, body) => API.post(`/api/projects/${pid}/issues-list`, body),
+  issueUpdate: (iid, body) => API.patch(`/api/issues/${iid}`, body),
+  issueDelete: (iid, actor) => API.del(`/api/issues/${iid}?actor_id=${actor}`),
+  issueComments: (iid) => API.get(`/api/issues/${iid}/comments`),
+  issueCommentAdd: (iid, body) => API.post(`/api/issues/${iid}/comments`, body),
+  issueCommentDel: (cid, actor) => API.del(`/api/issues/comments/${cid}?actor_id=${actor}`),
+  qaComments: (qid) => API.get(`/api/qa/${qid}/comments`),
+  qaCommentAdd: (qid, body) => API.post(`/api/qa/${qid}/comments`, body),
+  qaCommentDel: (cid, actor) => API.del(`/api/qa/comments/${cid}?actor_id=${actor}`),
 };
 
 /* ================= 共有ユーティリティ ================= */

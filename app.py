@@ -182,6 +182,65 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     value TEXT DEFAULT '{}',
     PRIMARY KEY (member_id, key)
 );
+CREATE TABLE IF NOT EXISTS qa_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    seq INTEGER,                           -- PJ内連番（QA-001 表示用）
+    title TEXT NOT NULL,                   -- 件名
+    question TEXT DEFAULT '',              -- 質問の詳細
+    answer TEXT DEFAULT '',                -- 回答
+    decision TEXT DEFAULT '',              -- 決定事項
+    note TEXT DEFAULT '',                  -- 備考
+    category TEXT DEFAULT '',              -- 分類（仕様/環境/データ 等 自由）
+    priority TEXT DEFAULT 'medium',        -- high / medium / low
+    status TEXT DEFAULT 'open',            -- open(回答待ち)/pending(保留)/answered(回答済み)/closed(クローズ)
+    asker_name TEXT DEFAULT '',            -- 質問者（顧客名等の自由記入）
+    assignee_id INTEGER REFERENCES members(id) ON DELETE SET NULL,  -- 回答担当
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,        -- 関連タスク
+    asked_at TEXT,                         -- 質問日
+    due_date TEXT,                         -- 回答期限
+    answered_at TEXT,                      -- 回答日
+    created_at TEXT, updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    seq INTEGER,                           -- PJ内連番（ISS-001 表示用）
+    title TEXT NOT NULL,                   -- 件名
+    description TEXT DEFAULT '',           -- 課題の内容・背景
+    policy TEXT DEFAULT '',                -- 方針
+    action_plan TEXT DEFAULT '',           -- 実行内容
+    category TEXT DEFAULT '',              -- 分類（自由）
+    priority TEXT DEFAULT 'medium',        -- highest/high/medium/low（重要度）
+    status TEXT DEFAULT 'open',            -- open(未対応)/doing(対応中)/resolved(解決済み)/closed(クローズ)
+    assignee_id INTEGER REFERENCES members(id) ON DELETE SET NULL,  -- 担当者
+    raised_by TEXT DEFAULT '',             -- 起票者（自由記入）
+    raised_at TEXT,                        -- 起票日
+    due_date TEXT,                         -- 対応期限
+    resolved_at TEXT,                      -- 解決日
+    created_at TEXT, updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS issue_tasks (   -- 課題⇔タスクの関連（多対多）
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (issue_id, task_id)
+);
+CREATE TABLE IF NOT EXISTS issue_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    author_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+    author_name TEXT DEFAULT '',
+    body TEXT NOT NULL,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS qa_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    qa_id INTEGER NOT NULL REFERENCES qa_items(id) ON DELETE CASCADE,
+    author_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+    author_name TEXT DEFAULT '',           -- 表示名（Excel取込・顧客発言など非メンバー用）
+    body TEXT NOT NULL,
+    created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
@@ -295,6 +354,10 @@ DEFAULT_PROJECT_SETTINGS = {
     "external_default_view_comments": False,
     "external_default_view_detail": False,
     "external_can_export": False,
+    # 外部パートナーに公開するタブ（変更はマネージャー/サイト管理者＋確認入力が必要）
+    # ※課題(kadai)は社内の管理情報のため、既定では外部に公開しない
+    "external_visible_tabs": ["dashboard", "board", "table", "gantt",
+                              "calendar", "qa", "issues", "notes"],
     # --- 担当者の追加選択肢（アサイン済みメンバー以外。例: 顧客・ベンダーA） ---
     "virtual_assignees": [],
     # --- 通知（Teams/Slack Incoming Webhook） ---
@@ -364,6 +427,11 @@ def migrate(conn: sqlite3.Connection):
         cur = conn.execute("INSERT INTO orgs(name, color, created_at) VALUES(?,?,?)",
                            ("既定の組織", "#4f6ef7", now()))
         conn.execute("UPDATE members SET org_id=? WHERE org_id IS NULL", (cur.lastrowid,))
+    # QA: 決定事項・備考カラム（2026-08-30追加）
+    qa_cols = {r["name"] for r in conn.execute("PRAGMA table_info(qa_items)")}
+    if qa_cols and "decision" not in qa_cols:
+        conn.execute("ALTER TABLE qa_items ADD COLUMN decision TEXT DEFAULT ''")
+        conn.execute("ALTER TABLE qa_items ADD COLUMN note TEXT DEFAULT ''")
     # 親タスク進捗の自動算出を既存データにも適用（毎起動・冪等）
     for r in conn.execute("SELECT id FROM projects"):
         recalc_parent_progress(conn, r["id"])
@@ -638,35 +706,107 @@ ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".txt"
 MAX_FILE_SIZE = 20 * 1024 * 1024   # 20MB
 
 
+def get_user_pref(conn, member_id, key, default=None):
+    r = conn.execute("SELECT value FROM user_prefs WHERE member_id=? AND key=?",
+                     (member_id, key)).fetchone()
+    if not r:
+        return default
+    try:
+        return json.loads(r["value"])
+    except ValueError:
+        return default
+
+
+def detect_webhook_provider(url: str) -> str:
+    """Webhook URL から送信先サービスを判定する。"""
+    u = (url or "").lower()
+    if "hooks.slack.com" in u:
+        return "slack"
+    if "chat.googleapis.com" in u:
+        return "googlechat"
+    if "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u:
+        return "discord"
+    if ".webhook.office.com" in u or ".logic.azure.com" in u:
+        return "teams"
+    return "text"
+
+
+def webhook_payload(provider: str, text: str) -> dict:
+    """サービスごとの Incoming Webhook ペイロード。
+    slack / googlechat / 汎用 = {"text"} ・ discord = {"content"} ・
+    teams = Workflows 用 Adaptive Card。"""
+    if provider == "discord":
+        return {"content": text[:1900]}   # Discordは2000文字制限
+    if provider == "teams":
+        return {"type": "message", "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard", "version": "1.2",
+                "body": [{"type": "TextBlock", "text": text, "wrap": True}],
+            }}]}
+    return {"text": text}   # slack / googlechat / 汎用
+
+
+def post_webhook_async(url, text, provider=None):
+    """Slack / Google Chat / Teams / Discord 等の Incoming Webhook へ非同期送信
+    （失敗しても本処理を止めない）。provider 未指定・auto はURLから自動判定。"""
+    if not provider or provider == "auto":
+        provider = detect_webhook_provider(url)
+    import threading
+    import urllib.request
+
+    def _post():
+        try:
+            body = json.dumps(webhook_payload(provider, text), ensure_ascii=False).encode()
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
+NOTIFY_TYPE_LABEL = {"mention": "メンション", "assign": "担当割当", "comment": "コメント",
+                     "status": "ステータス変更", "due": "期限リマインド",
+                     "watch": "ウォッチ", "system": "システム"}
+
+
 def notify(conn, user_id, ntype, project_id=None, task_id=None, actor_id=None, message=""):
-    """アプリ内通知。自分自身の操作は通知しない。"""
+    """アプリ内通知。自分自身の操作は通知しない。
+    ユーザー設定（notify_webhook）があれば外部チャット（Teams/Slack DM等）へも転送する。"""
     if user_id is None or user_id == actor_id:
         return
     conn.execute(
         "INSERT INTO notifications(user_id, type, project_id, task_id, actor_id,"
         " message, created_at) VALUES(?,?,?,?,?,?,?)",
         (user_id, ntype, project_id, task_id, actor_id, message, now()))
+    # 個人設定の外部転送（ユーザー設定ページで登録した Incoming Webhook 宛て）
+    try:
+        pw = get_user_pref(conn, user_id, "notify_webhook") or {}
+        url = (pw.get("url") or "").strip()
+        events = pw.get("events")
+        if pw.get("enabled") and url and (not events or ntype in events):
+            pname = ""
+            if project_id:
+                pr = conn.execute("SELECT name FROM projects WHERE id=?",
+                                  (project_id,)).fetchone()
+                pname = f"［{pr['name']}］" if pr else ""
+            post_webhook_async(
+                url, f"🔔 PJ Board {NOTIFY_TYPE_LABEL.get(ntype, ntype)}{pname} {message}",
+                provider=pw.get("provider"))
+    except Exception:
+        pass
 
 
 def send_webhook(conn, project_id, event, text):
-    """Teams/Slack Incoming Webhook へ非同期送信（設定があり、対象イベントの場合のみ）。"""
+    """PJ設定の Teams/Slack Incoming Webhook へ非同期送信（設定があり、対象イベントの場合のみ）。"""
     s = get_settings(conn, project_id)
     url = (s.get("webhook_url") or "").strip()
     if not url or event not in (s.get("webhook_events") or []):
         return
-    import threading
-    import urllib.request
-
-    def _post():
-        try:
-            body = json.dumps({"text": text}, ensure_ascii=False).encode()
-            req = urllib.request.Request(
-                url, data=body, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass   # 通知失敗で本処理を止めない
-
-    threading.Thread(target=_post, daemon=True).start()
+    post_webhook_async(url, text)
 
 
 def norm_name(s: str) -> str:
@@ -874,6 +1014,42 @@ def check_role(conn, pid, actor_id, allowed: set, msg: str):
         raise HTTPException(403, msg)
 
 
+# --- 外部ユーザー防御（緩め運用の例外: 外部アカウントには常に厳格に適用する） ---
+
+TAB_LABELS = {"dashboard": "ダッシュボード", "board": "ボード", "table": "テーブル",
+              "gantt": "WBSガント", "calendar": "カレンダー", "qa": "QA",
+              "kadai": "課題", "issues": "コメント一覧", "notes": "ノート"}
+
+
+def external_guard(pid: int, tab: Optional[str] = None):
+    """ログイン中の外部ユーザーに対する防御。
+    - 未アサインのプロジェクトへのアクセスを拒否
+    - tab 指定時は、PJ設定 external_visible_tabs に無い機能を拒否
+    社内ユーザー・未ログイン（自動化）はここでは制限しない。"""
+    su = CURRENT_USER.get()
+    if su is None or su.get("account_type") != "external":
+        return
+    with db() as conn:
+        if not get_membership(conn, pid, su["id"]):
+            raise HTTPException(403, "このプロジェクトへのアクセス権がありません")
+        if tab:
+            tabs = get_settings(conn, pid).get("external_visible_tabs") or []
+            if tab not in tabs:
+                raise HTTPException(
+                    403, f"このプロジェクトでは外部ユーザーに「{TAB_LABELS.get(tab, tab)}」は公開されていません")
+
+
+def _actor_rank(conn, actor_id) -> Optional[int]:
+    """操作者の組織ランク。ログイン中はセッションを優先。None=素通し（自動化）。"""
+    su = CURRENT_USER.get()
+    if su is not None:
+        return org_rank(su)
+    if actor_id is None:
+        return None
+    r = conn.execute("SELECT * FROM members WHERE id=?", (actor_id,)).fetchone()
+    return org_rank(dict(r)) if r else 1
+
+
 # ---------------------------------------------------------------- API: auth
 
 class LoginIn(BaseModel):
@@ -1069,12 +1245,36 @@ def create_project(p: ProjectIn):
     return project_row_to_dict(r)
 
 
+EXTERNAL_SETTING_KEYS = ("external_visible_tabs", "external_can_export",
+                         "external_default_view_comments", "external_default_view_detail")
+
+
 @app.patch("/api/projects/{pid}")
 def update_project(pid: int, p: dict, actor_id: Optional[int] = None):
     actor_id = resolve_uid(actor_id)
     with db() as conn:
         check_admin(conn, pid, actor_id,
                     "プロジェクト設定の変更はリーダーまたは組織の上位者のみ行えます")
+        # 外部パートナー公開設定の変更は「マネージャー／サイト管理者＋プロジェクト名の確認入力」を常に必須にする
+        # （チェックボックス1つで情報が漏れないよう、堅牢な二重確認）
+        if "settings" in p:
+            pr0 = conn.execute("SELECT name, settings FROM projects WHERE id=?",
+                               (pid,)).fetchone()
+            if not pr0:
+                raise HTTPException(404, "project not found")
+            old_s = merge_settings(pr0["settings"])
+            new_s = merge_settings(json.dumps(p["settings"], ensure_ascii=False))
+            changed = [k for k in EXTERNAL_SETTING_KEYS if old_s.get(k) != new_s.get(k)]
+            if changed:
+                rank = _actor_rank(conn, actor_id)
+                if rank is not None and rank < ORG_RANK["site_admin"]:
+                    raise HTTPException(
+                        403, "外部パートナーの公開設定の変更はマネージャー／サイト管理者のみ行えます")
+                if (p.get("confirm_text") or "").strip() != pr0["name"]:
+                    raise HTTPException(
+                        400, "外部公開設定の変更には、確認のためプロジェクト名の入力が必要です")
+                record_activity(conn, pid, None, actor_id, "settings",
+                                f"外部公開設定を変更: {', '.join(changed)}")
     allowed = {"name", "description", "color", "status", "start_date", "end_date",
                "custom_fields", "settings"}
     sets, vals = [], []
@@ -1106,6 +1306,7 @@ def delete_project(pid: int):
 @app.get("/api/projects/{pid}/data")
 def project_data(pid: int, user_id: Optional[int] = None):
     """1プロジェクト分の全ビュー用データをまとめて返す。"""
+    external_guard(pid)
     user_id = resolve_uid(user_id)
     with db() as conn:
         pr = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
@@ -1128,6 +1329,12 @@ def project_data(pid: int, user_id: Optional[int] = None):
             "SELECT task_id, COUNT(*) c FROM task_links"
             " WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?)"
             " GROUP BY task_id", (pid,))}
+        # タスクに紐づくオープン課題数（クローズ済みは数えない）
+        issue_counts = {r["task_id"]: r["c"] for r in conn.execute(
+            "SELECT it.task_id, COUNT(*) c FROM issue_tasks it"
+            " JOIN issues i ON i.id=it.issue_id"
+            " WHERE i.project_id=? AND i.status != 'closed'"
+            " GROUP BY it.task_id", (pid,))}
         activities = rows_to_dicts(conn.execute(
             "SELECT a.*, m.name actor_name, t.title task_title FROM activities a"
             " LEFT JOIN members m ON m.id=a.actor_id"
@@ -1139,6 +1346,7 @@ def project_data(pid: int, user_id: Optional[int] = None):
     for t in tasks:
         t["comment_count"] = counts.get(t["id"], 0)
         t["link_count"] = link_counts.get(t["id"], 0)
+        t["issue_count"] = issue_counts.get(t["id"], 0)
 
     my_flags = {"can_view_comments": 1, "can_view_detail": 1}
     my_project_role = membership["role"] if membership else None
@@ -1156,6 +1364,15 @@ def project_data(pid: int, user_id: Optional[int] = None):
             for t in tasks:
                 t["description"] = ""
             activities = []
+        # タブ単位の公開範囲: タスク系タブが1つも公開されていなければタスクを返さない
+        su = CURRENT_USER.get()
+        if su is not None and su.get("account_type") == "external":
+            with db() as conn:
+                tabs = get_settings(conn, pid).get("external_visible_tabs") or []
+            if not any(t2 in tabs for t2 in
+                       ("dashboard", "board", "table", "gantt", "calendar")):
+                tasks = []
+                activities = []
     return {"project": project_row_to_dict(pr), "statuses": statuses,
             "tasks": tasks, "members": members, "activities": activities,
             "my_role": my_role, "my_project_role": my_project_role,
@@ -1214,12 +1431,24 @@ def assign_member(pid: int, body: dict):
     with db() as conn:
         if not conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
             raise HTTPException(404, "project not found")
+        check_admin(conn, pid, body["actor_id"],
+                    "メンバーのアサインはリーダーまたは組織の上位者のみ行えます")
         m = conn.execute("SELECT * FROM members WHERE id=? AND active=1", (mid,)).fetchone()
         if not m:
             raise HTTPException(404, "user not found")
         # 外部アカウントは external ロール固定（社内ロールとの入替不可）、社内既定は member
         s = get_settings(conn, pid)
         is_ext = m["account_type"] == "external"
+        # 外部ユーザーのアサインは誤操作防止のため二重の保護:
+        #  1) マネージャー／サイト管理者のみ  2) 氏名の完全一致入力（confirm_name）を常に必須
+        if is_ext:
+            rank = _actor_rank(conn, body["actor_id"])
+            if rank is not None and rank < ORG_RANK["site_admin"]:
+                raise HTTPException(
+                    403, "外部ユーザーのアサインはマネージャー／サイト管理者のみ、管理画面から行えます")
+            if (body.get("confirm_name") or "").strip() != m["name"]:
+                raise HTTPException(
+                    400, "確認のため、アサインする外部ユーザーの氏名を正確に入力してください")
         role = body.get("role") or ("external" if is_ext else "member")
         if is_ext and role != "external":
             raise HTTPException(400, "外部アカウントには external 以外のロールを設定できません")
@@ -1244,10 +1473,16 @@ def update_project_member(pid: int, mid: int, body: dict):
     with db() as conn:
         check_admin(conn, pid, body.get("actor_id"),
                     "ロール変更はリーダーまたは組織の上位者のみ行えます")
+        m = conn.execute("SELECT account_type FROM members WHERE id=?",
+                         (mid,)).fetchone()
+        is_ext = m and m["account_type"] == "external"
+        # 外部ユーザーの閲覧フラグ緩和はマネージャー／サイト管理者のみ
+        if is_ext and ("can_view_comments" in body or "can_view_detail" in body):
+            rank = _actor_rank(conn, body.get("actor_id"))
+            if rank is not None and rank < ORG_RANK["site_admin"]:
+                raise HTTPException(
+                    403, "外部ユーザーの閲覧範囲の変更はマネージャー／サイト管理者のみ行えます")
         if "role" in body:
-            m = conn.execute("SELECT account_type FROM members WHERE id=?",
-                             (mid,)).fetchone()
-            is_ext = m and m["account_type"] == "external"
             if is_ext and body["role"] != "external":
                 raise HTTPException(400, "外部アカウントには external 以外のロールを設定できません")
             if not is_ext and body["role"] == "external":
@@ -1296,6 +1531,7 @@ class NoteIn(BaseModel):
 
 @app.get("/api/projects/{pid}/notes")
 def list_notes(pid: int):
+    external_guard(pid, "notes")
     with db() as conn:
         rows = conn.execute(
             "SELECT n.*, m.name updated_by_name FROM project_notes n"
@@ -1517,6 +1753,148 @@ def overview(user_id: Optional[int] = None):
                 f" WHERE a.project_id IN ({ph}) ORDER BY a.id DESC LIMIT 20", pids))
     return {"projects": projects, "my_tasks": my_tasks, "activities": activities,
             "today": today}
+
+
+# ---------------------------------------------------------------- API: 管理画面（マネージャー／サイト管理者）
+
+@app.get("/api/admin/projects")
+def admin_projects():
+    """管理画面のプロジェクト管理タブ用: 全PJの進捗・健全性・メンバー構成。"""
+    check_site_admin("管理画面はマネージャー／サイト管理者のみ利用できます")
+    today = date.today()
+    ts = today.isoformat()
+    stale_line = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    with db() as conn:
+        for pr in conn.execute("SELECT * FROM projects ORDER BY status='archived', id"):
+            pid = pr["id"]
+            done_ids = {s["id"] for s in conn.execute(
+                "SELECT id FROM statuses WHERE project_id=? AND is_done=1", (pid,))}
+            tasks = list(conn.execute(
+                "SELECT status_id, progress, due_date FROM tasks"
+                " WHERE project_id=? AND deleted_at IS NULL", (pid,)))
+            total = len(tasks)
+            done = sum(1 for t in tasks if t["status_id"] in done_ids)
+            overdue = sum(1 for t in tasks if t["due_date"] and t["due_date"] < ts
+                          and t["status_id"] not in done_ids)
+            avg = round(sum(t["progress"] or 0 for t in tasks) / total) if total else 0
+            qa_open = conn.execute(
+                "SELECT COUNT(*) c FROM qa_items WHERE project_id=?"
+                " AND status IN ('open','pending')", (pid,)).fetchone()["c"]
+            last_act = conn.execute(
+                "SELECT MAX(created_at) m FROM activities WHERE project_id=?",
+                (pid,)).fetchone()["m"]
+            members = rows_to_dicts(conn.execute(
+                "SELECT m.id, m.name, m.color, m.account_type, m.org_role, pm.role,"
+                " pm.can_view_comments, pm.can_view_detail"
+                " FROM project_members pm JOIN members m ON m.id=pm.member_id"
+                " WHERE pm.project_id=? AND m.active=1"
+                " ORDER BY pm.role='external', m.id", (pid,)))
+            p2 = project_row_to_dict(pr)
+            elapsed = None
+            if p2.get("start_date") and p2.get("end_date") and \
+                    p2["end_date"] > p2["start_date"]:
+                sd = datetime.strptime(p2["start_date"], "%Y-%m-%d").date()
+                ed = datetime.strptime(p2["end_date"], "%Y-%m-%d").date()
+                elapsed = max(0, min(100, round((today - sd).days /
+                                                max((ed - sd).days, 1) * 100)))
+            out.append({
+                "project": p2, "total": total, "done": done, "overdue": overdue,
+                "progress_avg": avg, "qa_open": qa_open, "last_activity": last_act,
+                "elapsed_pct": elapsed,
+                "stalled": bool(p2["status"] == "active" and last_act
+                                and last_act < stale_line),
+                "external_tabs": merge_settings(pr["settings"]).get("external_visible_tabs"),
+                "members": members,
+            })
+    return out
+
+
+@app.get("/api/admin/analytics")
+def admin_analytics():
+    """管理画面の横断分析タブ用: メンバー負荷・週次スループット・超過ワースト・外部アクセス。"""
+    check_site_admin("管理画面はマネージャー／サイト管理者のみ利用できます")
+    today = date.today()
+    ts = today.isoformat()
+    week_end = (today + timedelta(days=7)).isoformat()
+    with db() as conn:
+        done_ids = {r["id"] for r in conn.execute(
+            "SELECT id FROM statuses WHERE is_done=1")}
+        active_pids = {r["id"] for r in conn.execute(
+            "SELECT id FROM projects WHERE status='active'")}
+        pname = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM projects")}
+        parent_ids = {r["parent_id"] for r in conn.execute(
+            "SELECT DISTINCT parent_id FROM tasks"
+            " WHERE parent_id IS NOT NULL AND deleted_at IS NULL")}
+        tasks = [dict(r) for r in conn.execute(
+            "SELECT id, project_id, title, status_id, assignee_id, due_date,"
+            " estimate_h, updated_at FROM tasks WHERE deleted_at IS NULL")]
+        tasks = [t for t in tasks if t["project_id"] in active_pids]
+        members = rows_to_dicts(conn.execute("SELECT * FROM members WHERE active=1"))
+        # --- メンバー負荷（親タスクは除外して実作業のみ）
+        workload = []
+        d30 = (today - timedelta(days=30)).isoformat()
+        for m in members:
+            mine = [t for t in tasks
+                    if t["assignee_id"] == m["id"] and t["id"] not in parent_ids]
+            open_t = [t for t in mine if t["status_id"] not in done_ids]
+            workload.append({
+                "id": m["id"], "name": m["name"], "color": m["color"],
+                "account_type": m["account_type"], "org_role": m["org_role"],
+                "open": len(open_t),
+                "overdue": sum(1 for t in open_t
+                               if t["due_date"] and t["due_date"] < ts),
+                "due_week": sum(1 for t in open_t
+                                if t["due_date"] and ts <= t["due_date"] <= week_end),
+                "est_open": round(sum(t["estimate_h"] or 0 for t in open_t), 1),
+                "projects": len({t["project_id"] for t in open_t}),
+                "done_30d": sum(1 for t in mine if t["status_id"] in done_ids
+                                and (t["updated_at"] or "") >= d30),
+            })
+        workload.sort(key=lambda w: (-w["overdue"], -w["open"]))
+        # --- 週次スループット（完了ステータスのタスクの最終更新週・直近8週）
+        weekly = []
+        monday = today - timedelta(days=today.weekday())
+        for i in range(7, -1, -1):
+            ws_ = monday - timedelta(weeks=i)
+            we_ = (ws_ + timedelta(days=6)).isoformat()
+            weekly.append({
+                "label": f"{ws_.month}/{ws_.day}",
+                "done": sum(1 for t in tasks if t["status_id"] in done_ids
+                            and ws_.isoformat() <= (t["updated_at"] or "")[:10] <= we_)})
+        # --- 期限超過ワースト10
+        overdue_tasks = sorted(
+            [{"id": t["id"], "title": t["title"], "project_id": t["project_id"],
+              "project_name": pname.get(t["project_id"], ""),
+              "due_date": t["due_date"],
+              "assignee": next((m["name"] for m in members
+                                if m["id"] == t["assignee_id"]), None),
+              "days": (today - datetime.strptime(t["due_date"], "%Y-%m-%d").date()).days}
+             for t in tasks if t["due_date"] and t["due_date"] < ts
+             and t["status_id"] not in done_ids and t["id"] not in parent_ids],
+            key=lambda x: -x["days"])[:10]
+        # --- 外部ユーザーのアクセス状況（セキュリティレビュー用）
+        externals = []
+        for m in [x for x in members if x["account_type"] == "external"]:
+            pms = rows_to_dicts(conn.execute(
+                "SELECT pm.*, p.name project_name, p.settings FROM project_members pm"
+                " JOIN projects p ON p.id=pm.project_id WHERE pm.member_id=?",
+                (m["id"],)))
+            last_login = conn.execute(
+                "SELECT MAX(created_at) m FROM login_logs"
+                " WHERE member_id=? AND success=1", (m["id"],)).fetchone()["m"]
+            externals.append({
+                "id": m["id"], "name": m["name"], "email": m["email"],
+                "last_login": last_login,
+                "projects": [{
+                    "project_id": x["project_id"], "name": x["project_name"],
+                    "can_view_comments": x["can_view_comments"],
+                    "can_view_detail": x["can_view_detail"],
+                    "tabs": merge_settings(x["settings"]).get("external_visible_tabs"),
+                } for x in pms],
+            })
+    return {"workload": workload, "weekly_done": weekly,
+            "overdue_tasks": overdue_tasks, "externals": externals}
 
 
 # ---------------------------------------------------------------- API: members
@@ -1922,6 +2300,8 @@ def task_detail(tid: int, user_id: Optional[int] = None):
     user_id = resolve_uid(user_id)
     with db() as conn:
         t = get_task_or_404(conn, tid)
+    external_guard(t["project_id"])   # 未アサインの外部を遮断（セッション基準）
+    with db() as conn:
         hide_comments = False
         if user_id is not None:
             if effective_role(conn, t["project_id"], user_id) == "external":
@@ -1955,12 +2335,17 @@ def task_detail(tid: int, user_id: Optional[int] = None):
             " WHERE r.task_id=? AND t2.deleted_at IS NULL ORDER BY r.id", (tid,)))
         reactions = reactions_for_comments(
             conn, [c["id"] for c in comments], user_id)
+        rel_issues = rows_to_dicts(conn.execute(
+            "SELECT i.id, i.seq, i.title, i.status FROM issue_tasks it"
+            " JOIN issues i ON i.id=it.issue_id WHERE it.task_id=?"
+            " ORDER BY i.status='closed', i.seq", (tid,)))
     for c in comments:
         c["reactions"] = reactions.get(c["id"], [])
     return {"task": t, "comments": comments, "links": links,
             "subtasks": subtasks, "activities": activities,
             "comments_hidden": hide_comments, "watching": watching,
-            "attachments": attachments, "relations": relations}
+            "attachments": attachments, "relations": relations,
+            "issues": rel_issues}
 
 
 # ---------------------------------------------------------------- API: comments / links
@@ -2042,6 +2427,7 @@ def delete_link(lid: int):
 
 def check_export_allowed(pid: int):
     """外部ユーザーのエクスポートはPJ設定で許可されている場合のみ。"""
+    external_guard(pid)   # 未アサインの外部を遮断
     su = CURRENT_USER.get()
     if su is None:
         return
@@ -2134,9 +2520,40 @@ def collect_export_data(pid: int) -> dict:
             " LEFT JOIN members m ON m.id=a.actor_id"
             " LEFT JOIN tasks t ON t.id=a.task_id"
             " WHERE a.project_id=? ORDER BY a.id", (pid,)))
+        qa = rows_to_dicts(conn.execute(
+            "SELECT q.*, m.name assignee_name, t.title task_title FROM qa_items q"
+            " LEFT JOIN members m ON m.id=q.assignee_id"
+            " LEFT JOIN tasks t ON t.id=q.task_id"
+            " WHERE q.project_id=? ORDER BY q.seq, q.id", (pid,)))
+        qac = rows_to_dicts(conn.execute(
+            "SELECT c.*, m.name member_name FROM qa_comments c"
+            " LEFT JOIN members m ON m.id=c.author_id"
+            " WHERE c.qa_id IN (SELECT id FROM qa_items WHERE project_id=?)"
+            " ORDER BY c.qa_id, c.id", (pid,)))
+        qac_by: dict = {}
+        for c in qac:
+            qac_by.setdefault(c["qa_id"], []).append(c)
+        for q in qa:
+            q["comments"] = qac_by.get(q["id"], [])
+        issues = rows_to_dicts(conn.execute(
+            "SELECT i.*, m.name assignee_name FROM issues i"
+            " LEFT JOIN members m ON m.id=i.assignee_id"
+            " WHERE i.project_id=? ORDER BY i.seq, i.id", (pid,)))
+        itmap = _issue_tasks_map(conn, pid)
+        ic = rows_to_dicts(conn.execute(
+            "SELECT c.*, m.name member_name FROM issue_comments c"
+            " LEFT JOIN members m ON m.id=c.author_id"
+            " WHERE c.issue_id IN (SELECT id FROM issues WHERE project_id=?)"
+            " ORDER BY c.issue_id, c.id", (pid,)))
+        ic_by: dict = {}
+        for c in ic:
+            ic_by.setdefault(c["issue_id"], []).append(c)
+        for i in issues:
+            i["tasks"] = itmap.get(i["id"], [])
+            i["comments"] = ic_by.get(i["id"], [])
     return {"project": project, "statuses": statuses, "tasks": tasks,
             "members": members, "comments": comments, "links": links,
-            "notes": notes, "activities": activities}
+            "notes": notes, "activities": activities, "qa": qa, "issues": issues}
 
 
 def build_wbs_rows(tasks: list[dict]) -> list[dict]:
@@ -2321,6 +2738,37 @@ def export_xlsx(pid: int):
     for col, wd in zip("ABCDE", [12, 28, 70, 14, 20]):
         ws5.column_dimensions[col].width = wd
 
+    # --- QAシート
+    ws6 = wb.create_sheet("QA")
+    ws6.append(["No", "分類", "件名", "質問", "質問者", "質問日", "回答担当",
+                "回答期限", "ステータス", "回答", "回答日", "決定事項", "備考",
+                "やり取り履歴"])
+    style_header(ws6, 14)
+    for q in d["qa"]:
+        ws6.append([q["seq"], q["category"], q["title"], q["question"],
+                    q["asker_name"], q["asked_at"], q.get("assignee_name") or "",
+                    q["due_date"], QA_STATUS_LABEL.get(q["status"], q["status"]),
+                    q["answer"], q["answered_at"], q.get("decision") or "",
+                    q.get("note") or "",
+                    "\n".join(_fmt_qa_comment_line(c) for c in q.get("comments", []))])
+    for i, wd in enumerate([6, 10, 26, 44, 12, 11, 12, 11, 10, 44, 11, 30, 22, 48], 1):
+        ws6.column_dimensions[get_column_letter(i)].width = wd
+
+    # --- 課題シート
+    ws7 = wb.create_sheet("課題")
+    ws7.append(["No", "重要度", "分類", "件名", "課題内容", "起票者", "起票日", "担当",
+                "対応期限", "状態", "方針", "実行内容", "解決日", "関連タスク"])
+    style_header(ws7, 14)
+    for q in d["issues"]:
+        ws7.append([q["seq"], PRIORITY_LABEL.get(q["priority"], q["priority"]),
+                    q["category"], q["title"], q["description"], q["raised_by"],
+                    q["raised_at"], q.get("assignee_name") or "", q["due_date"],
+                    ISSUE_STATUS_LABEL.get(q["status"], q["status"]),
+                    q["policy"], q["action_plan"], q["resolved_at"],
+                    " / ".join(t2["title"] for t2 in q.get("tasks", []))])
+    for i, wd in enumerate([6, 8, 10, 26, 40, 11, 11, 12, 11, 10, 34, 34, 11, 30], 1):
+        ws7.column_dimensions[get_column_letter(i)].width = wd
+
     bio = _save_wb_with_ignores(wb)
     fname = f"project_{pid}_{date.today().isoformat()}.xlsx"
     return StreamingResponse(
@@ -2362,8 +2810,8 @@ def export_view_xlsx(pid: int, body: dict):
     from openpyxl.utils import get_column_letter
 
     view = body.get("view")
-    if view not in ("table", "wbs", "board", "calendar"):
-        raise HTTPException(400, "view は table / wbs / board / calendar を指定してください")
+    if view not in ("table", "wbs", "board", "calendar", "qa", "kadai"):
+        raise HTTPException(400, "view は table / wbs / board / calendar / qa / kadai を指定してください")
     colors = body.get("colors") or {}
     d = collect_export_data(pid)
     if body.get("ids"):
@@ -2409,7 +2857,7 @@ def export_view_xlsx(pid: int, body: dict):
         else:
             d0, ndays = today, 0
         days = [d0 + timedelta(days=i) for i in range(ndays)]
-        LEFT = ["WBS", "タスク名", "担当", "開始", "期限", "進捗"]
+        LEFT = ["ID", "WBS", "タスク名", "担当", "開始", "期限", "進捗"]   # ID=取込時の突合キー
         NL = len(LEFT)
         # ヘッダー3段（月 / 日 / 曜日）
         for ci, label in enumerate(LEFT, 1):
@@ -2443,25 +2891,28 @@ def export_view_xlsx(pid: int, body: dict):
         if days:
             ws.merge_cells(start_row=1, start_column=NL + 1 + month_start,
                            end_row=1, end_column=NL + len(days))
-        for ci, w in enumerate([7, 38, 12, 11, 11, 7], 1):
+        for ci, w in enumerate([5, 7, 38, 12, 11, 11, 7], 1):
             ws.column_dimensions[get_column_letter(ci)].width = w
         # 明細行
         parents = {t["parent_id"] for t in d["tasks"] if t["parent_id"]}
         for ri, t in enumerate(rows, 4):
             is_parent = t["id"] in parents
-            vals = [t["wbs"], ("　" * t["depth"]) + ("◆ " if t["milestone"] else "") + t["title"],
+            vals = [t["id"], t["wbs"],
+                    ("　" * t["depth"]) + ("◆ " if t["milestone"] else "") + t["title"],
                     assignee_disp(t) or "—", t["start_date"] or "", t["due_date"] or "",
                     (t["progress"] or 0) / 100]
             for ci, v in enumerate(vals, 1):
                 c = ws.cell(row=ri, column=ci, value=v)
                 c.border = grid
-                c.alignment = vcenter if ci == 2 else center
-                if ci == 6:
+                c.alignment = vcenter if ci == 3 else center
+                if ci == 1:
+                    c.font = XFont(size=8, color="94A3B8")
+                if ci == 7:
                     c.number_format = "0%"    # 数値として書き込み（文字列警告を出さない）
                 if is_parent:
                     c.font = XFont(bold=True)
                     c.fill = sfill("EEF1F7")
-                elif ci == 3 and (t["assignee_id"] or t.get("assignee_label")):
+                elif ci == 4 and (t["assignee_id"] or t.get("assignee_label")):
                     # 担当セルは画面同様に担当者色（淡色）で塗る
                     c.fill = sfill(_tint(_assignee_hex(t, members_by_id, colors), 0.72))
             ws.row_dimensions[ri].height = 18
@@ -2494,13 +2945,13 @@ def export_view_xlsx(pid: int, body: dict):
                     c.fill = sfill("F1F3F9")
         ws.freeze_panes = f"{get_column_letter(NL + 1)}4"
         if rows:
-            _ignore_number_as_text(ws, f"A4:A{3 + len(rows)}")   # WBS番号 "1.1" 等
+            _ignore_number_as_text(ws, f"B4:B{3 + len(rows)}")   # WBS番号 "1.1" 等
 
     # ---------- テーブル ----------
     elif view == "table":
         ws.title = "テーブル"
         cf_defs = d["project"].get("custom_fields") or []
-        headers = ["WBS", "タスク名", "ステータス", "担当者", "優先度", "開始", "期限",
+        headers = ["ID", "WBS", "タスク名", "ステータス", "担当者", "優先度", "開始", "期限",
                    "進捗", "見積h", "実績h", "タグ"] + [f["label"] for f in cf_defs]
         for ci, hcell in enumerate(headers, 1):
             c = ws.cell(row=1, column=ci, value=hcell)
@@ -2510,7 +2961,8 @@ def export_view_xlsx(pid: int, body: dict):
         for ri, t in enumerate(rows, 2):
             st = smap.get(t["status_id"], {})
             done = bool(st.get("is_done"))
-            vals = [t["wbs"], ("　" * t["depth"]) + ("◆ " if t["milestone"] else "") + t["title"],
+            vals = [t["id"], t["wbs"],
+                    ("　" * t["depth"]) + ("◆ " if t["milestone"] else "") + t["title"],
                     st.get("name", "—"), assignee_disp(t) or "—",
                     PRIORITY_LABEL.get(t["priority"], t["priority"]),
                     t["start_date"] or "", t["due_date"] or "", (t["progress"] or 0) / 100,
@@ -2519,31 +2971,33 @@ def export_view_xlsx(pid: int, body: dict):
             for ci, v in enumerate(vals, 1):
                 c = ws.cell(row=ri, column=ci, value=v)
                 c.border = grid
-                c.alignment = vcenter if ci in (2, 11) else center
-                if ci == 3 and st:                      # ステータス: 画面のバッジ同様に色付け
+                c.alignment = vcenter if ci in (3, 12) else center
+                if ci == 1:
+                    c.font = XFont(size=8, color="94A3B8")
+                if ci == 4 and st:                      # ステータス: 画面のバッジ同様に色付け
                     c.fill = sfill(_hex6(st.get("color"), "8B95A7"))
                     c.font = XFont(color="FFFFFF", bold=True, size=10)
-                if ci == 4 and (t["assignee_id"] or t.get("assignee_label")):
+                if ci == 5 and (t["assignee_id"] or t.get("assignee_label")):
                     c.fill = sfill(_tint(_assignee_hex(t, members_by_id, colors), 0.75))
-                if ci == 7 and t["due_date"] and not done and (t["progress"] or 0) < 100 \
+                if ci == 8 and t["due_date"] and not done and (t["progress"] or 0) < 100 \
                         and t["due_date"] < today.isoformat():
                     c.font = XFont(color="DC2626", bold=True)   # 期限超過
-                if ci == 8:
+                if ci == 9:
                     c.number_format = "0%"
-                if t["id"] in parents and ci == 2:
+                if t["id"] in parents and ci == 3:
                     c.font = XFont(bold=True)
         # 進捗のデータバー（画面のミニバー相当）
         if len(rows):
             from openpyxl.formatting.rule import DataBarRule
             ws.conditional_formatting.add(
-                f"H2:H{len(rows) + 1}",
+                f"I2:I{len(rows) + 1}",
                 DataBarRule(start_type="num", start_value=0, end_type="num", end_value=1,
                             color="4F6EF7", showValue=True))
-        for ci, w in enumerate([7, 40, 12, 14, 8, 11, 11, 9, 7, 7, 18], 1):
+        for ci, w in enumerate([5, 7, 40, 12, 14, 8, 11, 11, 9, 7, 7, 18], 1):
             ws.column_dimensions[get_column_letter(ci)].width = w
         ws.freeze_panes = "A2"
         if rows:
-            _ignore_number_as_text(ws, f"A2:A{1 + len(rows)}")   # WBS番号 "1.1" 等
+            _ignore_number_as_text(ws, f"B2:B{1 + len(rows)}")   # WBS番号 "1.1" 等
 
     # ---------- ボード（カンバン） ----------
     elif view == "board":
@@ -2566,6 +3020,120 @@ def export_view_xlsx(pid: int, body: dict):
                 c.fill = sfill(_tint(_assignee_hex(t, members_by_id, colors), 0.82))
                 ws.row_dimensions[ri].height = max(
                     ws.row_dimensions[ri].height or 0, 34)
+
+    # ---------- QA管理表（顧客提出用） ----------
+    elif view == "qa":
+        ws.title = "QA管理表"
+        pr = d["project"]
+        tcell = ws.cell(row=1, column=1, value=f"QA管理表 ― {pr['name']}")
+        tcell.font = XFont(bold=True, size=14)
+        total_qa = len(d["qa"])
+        open_qa = sum(1 for q in d["qa"] if q["status"] in ("open", "pending"))
+        mcell = ws.cell(row=2, column=1,
+                        value=f"出力日: {today.isoformat()} ／ 全 {total_qa} 件"
+                              f"（未回答・保留 {open_qa} 件）")
+        mcell.font = XFont(color="64748B", size=10)
+        headers = ["No", "分類", "件名・質問内容", "質問者", "質問日", "回答担当",
+                   "回答期限", "ステータス", "回答", "回答日", "決定事項", "備考",
+                   "やり取り履歴"]
+        HR = 4
+        for ci, hv in enumerate(headers, 1):
+            c = ws.cell(row=HR, column=ci, value=hv)
+            c.fill, c.font, c.border, c.alignment = head_fill, head_font, grid, center
+        st_colors = {"open": "E05252", "pending": "F59E0B",
+                     "answered": "4F6EF7", "closed": "16A34A"}
+        wrap_top = Alignment(wrap_text=True, vertical="top")
+        center_top = Alignment(horizontal="center", vertical="top", wrap_text=True)
+        for ri, q in enumerate(d["qa"], HR + 1):
+            qtext = q["title"] + (f"\n{q['question']}" if q["question"] else "")
+            atext = q["answer"] or ""
+            overdue = (q["due_date"] and q["status"] in ("open", "pending")
+                       and q["due_date"] < today.isoformat())
+            dtext = q.get("decision") or ""
+            ntext = q.get("note") or ""
+            ttext = "\n".join(_fmt_qa_comment_line(c) for c in q.get("comments", []))
+            vals = [q["seq"], q["category"] or "", qtext, q["asker_name"] or "",
+                    q["asked_at"] or "", q.get("assignee_name") or "",
+                    q["due_date"] or "", QA_STATUS_LABEL.get(q["status"], q["status"]),
+                    atext, q["answered_at"] or "", dtext, ntext, ttext]
+            for ci, v in enumerate(vals, 1):
+                c = ws.cell(row=ri, column=ci, value=v)
+                c.border = grid
+                c.alignment = wrap_top if ci in (3, 9, 11, 12, 13) else center_top
+                if ci == 8:
+                    c.fill = sfill(st_colors.get(q["status"], "8B95A7"))
+                    c.font = XFont(color="FFFFFF", bold=True, size=10)
+                if ci == 13:
+                    c.font = XFont(size=9, color="475569")
+                if ci == 7 and overdue:
+                    c.font = XFont(color="DC2626", bold=True)
+            lines = max(qtext.count("\n") + 1, atext.count("\n") + 1,
+                        dtext.count("\n") + 1, ntext.count("\n") + 1,
+                        ttext.count("\n") + 1,
+                        -(-len(qtext) // 28), -(-len(atext) // 32),
+                        -(-len(dtext) // 18), -(-len(ntext) // 14), 1)
+            ws.row_dimensions[ri].height = min(15 * lines + 6, 220)
+        for ci, wd in enumerate([6, 10, 46, 12, 11, 12, 11, 11, 52, 11, 30, 22, 48], 1):
+            ws.column_dimensions[get_column_letter(ci)].width = wd
+        ws.freeze_panes = f"A{HR + 1}"
+
+    # ---------- 課題管理表 ----------
+    elif view == "kadai":
+        ws.title = "課題管理表"
+        pr = d["project"]
+        tcell = ws.cell(row=1, column=1, value=f"課題管理表 ― {pr['name']}")
+        tcell.font = XFont(bold=True, size=14)
+        total_i = len(d["issues"])
+        open_i = sum(1 for i in d["issues"] if i["status"] != "closed")
+        mcell = ws.cell(row=2, column=1,
+                        value=f"出力日: {today.isoformat()} ／ 全 {total_i} 件"
+                              f"（オープン {open_i} 件）")
+        mcell.font = XFont(color="64748B", size=10)
+        headers = ["No", "重要度", "分類", "件名・課題内容", "起票者", "起票日",
+                   "担当", "対応期限", "状態", "方針", "実行内容", "解決日",
+                   "関連タスク", "コメント履歴"]
+        HR = 4
+        for ci, hv in enumerate(headers, 1):
+            c = ws.cell(row=HR, column=ci, value=hv)
+            c.fill, c.font, c.border, c.alignment = head_fill, head_font, grid, center
+        ist_colors = {"open": "E05252", "doing": "F59E0B",
+                      "resolved": "16A34A", "closed": "64748B"}
+        wrap_top = Alignment(wrap_text=True, vertical="top")
+        center_top = Alignment(horizontal="center", vertical="top", wrap_text=True)
+        for ri, q in enumerate(d["issues"], HR + 1):
+            qtext = q["title"] + (f"\n{q['description']}" if q["description"] else "")
+            overdue = (q["due_date"] and q["status"] in ("open", "doing")
+                       and q["due_date"] < today.isoformat())
+            ttext = "\n".join(_fmt_qa_comment_line(c) for c in q.get("comments", []))
+            reltext = "\n".join(t2["title"] for t2 in q.get("tasks", []))
+            vals = [q["seq"], PRIORITY_LABEL.get(q["priority"], q["priority"]),
+                    q["category"] or "", qtext, q["raised_by"] or "",
+                    q["raised_at"] or "", q.get("assignee_name") or "",
+                    q["due_date"] or "",
+                    ISSUE_STATUS_LABEL.get(q["status"], q["status"]),
+                    q["policy"] or "", q["action_plan"] or "",
+                    q["resolved_at"] or "", reltext, ttext]
+            for ci, v in enumerate(vals, 1):
+                c = ws.cell(row=ri, column=ci, value=v)
+                c.border = grid
+                c.alignment = wrap_top if ci in (4, 10, 11, 13, 14) else center_top
+                if ci == 9:
+                    c.fill = sfill(ist_colors.get(q["status"], "8B95A7"))
+                    c.font = XFont(color="FFFFFF", bold=True, size=10)
+                if ci == 14:
+                    c.font = XFont(size=9, color="475569")
+                if ci == 8 and overdue:
+                    c.font = XFont(color="DC2626", bold=True)
+                if ci == 2 and q["priority"] in ("highest", "high"):
+                    c.font = XFont(color="DC2626", bold=True)
+            texts = [qtext, q["policy"] or "", q["action_plan"] or "", ttext, reltext]
+            lines = max([t3.count("\n") + 1 for t3 in texts] +
+                        [-(-len(qtext) // 26), -(-len(q["policy"] or "") // 22),
+                         -(-len(q["action_plan"] or "") // 22), 1])
+            ws.row_dimensions[ri].height = min(15 * lines + 6, 220)
+        for ci, wd in enumerate([6, 8, 10, 40, 11, 11, 11, 11, 10, 34, 34, 11, 24, 40], 1):
+            ws.column_dimensions[get_column_letter(ci)].width = wd
+        ws.freeze_panes = f"A{HR + 1}"
 
     # ---------- カレンダー（Google式の横断バー） ----------
     else:
@@ -2707,6 +3275,37 @@ def export_html(pid: int):
             f'<td><div class="pbar"><div style="width:{t["progress"]}%"></div></div>'
             f'{t["progress"]}%</td></tr>')
 
+    qa_st_color = {"open": "#e05252", "pending": "#f59e0b",
+                   "answered": "#4f6ef7", "closed": "#16a34a"}
+    qa_rows = "".join(
+        f'<tr><td>QA-{q["seq"]:03d}</td><td>{esc(q["category"])}</td>'
+        f'<td><b>{esc(q["title"])}</b>'
+        f'{"<div class=desc>" + esc(q["question"]) + "</div>" if q["question"] else ""}</td>'
+        f'<td>{esc(q["asker_name"])}</td><td>{esc(q["asked_at"] or "")}</td>'
+        f'<td>{esc(q.get("assignee_name") or "")}</td><td>{esc(q["due_date"] or "")}</td>'
+        f'<td><span class="badge" style="background:{qa_st_color.get(q["status"], "#8b95a7")}">'
+        f'{esc(QA_STATUS_LABEL.get(q["status"], q["status"]))}</span></td>'
+        f'<td class="desc">{esc(q["answer"])}</td><td>{esc(q["answered_at"] or "")}</td>'
+        f'<td class="desc">{esc(q.get("decision") or "")}</td>'
+        f'<td class="desc">{esc(q.get("note") or "")}</td>'
+        f'<td class="desc">{esc(chr(10).join(_fmt_qa_comment_line(c) for c in q.get("comments", [])))}</td></tr>'
+        for q in d["qa"])
+
+    iss_st_color = {"open": "#e05252", "doing": "#f59e0b",
+                    "resolved": "#16a34a", "closed": "#64748b"}
+    issue_rows = "".join(
+        f'<tr><td>ISS-{q["seq"]:03d}</td>'
+        f'<td>{esc(PRIORITY_LABEL.get(q["priority"], q["priority"]))}</td>'
+        f'<td><b>{esc(q["title"])}</b>'
+        f'{"<div class=desc>" + esc(q["description"]) + "</div>" if q["description"] else ""}</td>'
+        f'<td>{esc(q["raised_by"])}</td><td>{esc(q["raised_at"] or "")}</td>'
+        f'<td>{esc(q.get("assignee_name") or "")}</td><td>{esc(q["due_date"] or "")}</td>'
+        f'<td><span class="badge" style="background:{iss_st_color.get(q["status"], "#8b95a7")}">'
+        f'{esc(ISSUE_STATUS_LABEL.get(q["status"], q["status"]))}</span></td>'
+        f'<td class="desc">{esc(q["policy"])}</td><td class="desc">{esc(q["action_plan"])}</td>'
+        f'<td class="desc">{esc(chr(10).join(t2["title"] for t2 in q.get("tasks", [])))}</td></tr>'
+        for q in d["issues"])
+
     notes_sections = ""
     for n in d["notes"]:
         notes_sections += (
@@ -2785,6 +3384,10 @@ summary{{cursor:pointer;font-weight:600}}
 <th>優先度</th><th>開始</th><th>期限</th><th>進捗</th></tr></thead>
 <tbody>{table_rows}</tbody></table>
 <h2>タスク詳細・議論ログ</h2>{detail_sections}
+<h2>QA（全 {len(d["qa"])} 件）</h2>
+{'<table><thead><tr><th>No</th><th>分類</th><th>件名・質問</th><th>質問者</th><th>質問日</th><th>回答担当</th><th>回答期限</th><th>状態</th><th>回答</th><th>回答日</th><th>決定事項</th><th>備考</th><th>やり取り履歴</th></tr></thead><tbody>' + qa_rows + '</tbody></table>' if d["qa"] else '<p class="meta">なし</p>'}
+<h2>課題（全 {len(d["issues"])} 件・オープン {sum(1 for q in d["issues"] if q["status"] != "closed")} 件）</h2>
+{'<table><thead><tr><th>No</th><th>重要度</th><th>件名・内容</th><th>起票者</th><th>起票日</th><th>担当</th><th>期限</th><th>状態</th><th>方針</th><th>実行内容</th><th>関連タスク</th></tr></thead><tbody>' + issue_rows + '</tbody></table>' if d["issues"] else '<p class="meta">なし</p>'}
 <h2>ノート</h2>{notes_sections or '<p class="meta">なし</p>'}
 <h2>アクティビティ履歴（全 {len(d["activities"])} 件）</h2>
 <details><summary>履歴を開く</summary>
@@ -2933,6 +3536,33 @@ def set_pref(body: dict):
     return {"ok": True}
 
 
+@app.post("/api/me/webhook-test")
+def webhook_test(body: dict):
+    """ユーザー設定の通知転送Webhookへテスト送信（同期・結果を返す）。"""
+    su = CURRENT_USER.get()
+    uid = su["id"] if su else resolve_uid(body.get("user_id"))
+    if uid is None:
+        raise HTTPException(401, "ログインが必要です")
+    url = (body.get("url") or "").strip()
+    if not url.startswith("https://"):
+        raise HTTPException(400, "https:// で始まる Incoming Webhook URL を指定してください")
+    provider = body.get("provider") or "auto"
+    if provider == "auto":
+        provider = detect_webhook_provider(url)
+    import urllib.request
+    try:
+        data = json.dumps(
+            webhook_payload(provider,
+                            "✅ PJ Board: 通知転送のテスト送信です。この通知が見えていれば設定は有効です"),
+            ensure_ascii=False).encode()
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        raise HTTPException(400, f"送信に失敗しました: {e}")
+    return {"ok": True, "provider": provider}
+
+
 # ---------------------------------------------------------------- API: 通知
 
 @app.get("/api/notifications")
@@ -3033,6 +3663,17 @@ def download_file(aid: int):
         r = conn.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
     if not r:
         raise HTTPException(404, "file not found")
+    # 外部ユーザー: 添付の所属プロジェクトのメンバーでなければ拒否
+    with db() as conn:
+        if r["target_type"] == "task":
+            p0 = conn.execute("SELECT project_id FROM tasks WHERE id=?",
+                              (r["target_id"],)).fetchone()
+        else:
+            p0 = conn.execute("SELECT project_id FROM project_notes WHERE id=?",
+                              (r["target_id"],)).fetchone()
+    if p0:
+        external_guard(p0["project_id"],
+                       "notes" if r["target_type"] == "note" else None)
     path = os.path.join(FILES_DIR, r["stored_name"])
     if not os.path.exists(path):
         raise HTTPException(404, "file missing on disk")
@@ -3152,6 +3793,718 @@ def restore_note(nid: int, body: dict):
                    {"admin", "member"}, "復元する権限がありません")
         conn.execute("UPDATE project_notes SET deleted_at=NULL WHERE id=?", (nid,))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- API: QA管理
+
+QA_STATUS_LABEL = {"open": "回答待ち", "pending": "保留",
+                   "answered": "回答済み", "closed": "クローズ"}
+
+
+@app.get("/api/projects/{pid}/qa")
+def list_qa(pid: int):
+    external_guard(pid, "qa")
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            "SELECT q.*, m.name assignee_name, t.title task_title,"
+            " (SELECT COUNT(*) FROM qa_comments c WHERE c.qa_id=q.id) comment_count"
+            " FROM qa_items q"
+            " LEFT JOIN members m ON m.id=q.assignee_id"
+            " LEFT JOIN tasks t ON t.id=q.task_id"
+            " WHERE q.project_id=? ORDER BY q.seq, q.id", (pid,)))
+    return rows
+
+
+@app.post("/api/projects/{pid}/qa")
+def create_qa(pid: int, body: dict):
+    actor = resolve_uid(body.get("actor_id"))
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "件名を入力してください")
+    with db() as conn:
+        check_role(conn, pid, actor, {"admin", "member"},
+                   "QAを追加する権限がありません")
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 s FROM qa_items"
+                           " WHERE project_id=?", (pid,)).fetchone()["s"]
+        cur = conn.execute(
+            "INSERT INTO qa_items(project_id, seq, title, question, answer, decision,"
+            " note, category, priority, status, asker_name, assignee_id, task_id,"
+            " asked_at, due_date, answered_at, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, seq, title, body.get("question") or "", body.get("answer") or "",
+             body.get("decision") or "", body.get("note") or "",
+             body.get("category") or "", body.get("priority") or "medium",
+             body.get("status") or "open", body.get("asker_name") or "",
+             body.get("assignee_id"), body.get("task_id"),
+             body.get("asked_at") or date.today().isoformat(),
+             body.get("due_date"), body.get("answered_at"), now(), now()))
+        record_activity(conn, pid, None, actor, "create", f"QA-{seq:03d}「{title}」")
+        if body.get("assignee_id"):
+            notify(conn, body["assignee_id"], "system", pid, None, actor,
+                   f"QA-{seq:03d}「{title}」の回答担当になりました")
+        r = conn.execute("SELECT * FROM qa_items WHERE id=?", (cur.lastrowid,)).fetchone()
+    return dict(r)
+
+
+@app.patch("/api/qa/{qid}")
+def update_qa(qid: int, body: dict):
+    actor = resolve_uid(body.pop("actor_id", None))
+    allowed = {"title", "question", "answer", "decision", "note", "category",
+               "priority", "status", "asker_name", "assignee_id", "task_id",
+               "asked_at", "due_date", "answered_at"}
+    data = {k: v for k, v in body.items() if k in allowed}
+    if not data:
+        raise HTTPException(400, "no fields")
+    with db() as conn:
+        old = conn.execute("SELECT * FROM qa_items WHERE id=?", (qid,)).fetchone()
+        if not old:
+            raise HTTPException(404, "QA not found")
+        check_role(conn, old["project_id"], actor, {"admin", "member"},
+                   "QAを編集する権限がありません")
+        # 回答が入ったら自動で「回答済み」・回答日を補完
+        new_status = data.get("status", old["status"])
+        new_answer = data.get("answer", old["answer"])
+        if new_answer.strip() and old["status"] == "open" and "status" not in data:
+            data["status"] = new_status = "answered"
+        if new_status == "answered" and not (data.get("answered_at") or old["answered_at"]):
+            data["answered_at"] = date.today().isoformat()
+        sets = [f"{k}=?" for k in data] + ["updated_at=?"]
+        vals = list(data.values()) + [now(), qid]
+        conn.execute(f"UPDATE qa_items SET {', '.join(sets)} WHERE id=?", vals)
+        if "assignee_id" in data and data["assignee_id"] and \
+                data["assignee_id"] != old["assignee_id"]:
+            notify(conn, data["assignee_id"], "system", old["project_id"], None, actor,
+                   f"QA-{old['seq']:03d}「{old['title']}」の回答担当になりました")
+        if "status" in data and data["status"] != old["status"]:
+            record_activity(conn, old["project_id"], None, actor, "status",
+                            f"QA-{old['seq']:03d}: {QA_STATUS_LABEL.get(old['status'], '')}"
+                            f" → {QA_STATUS_LABEL.get(data['status'], '')}")
+        r = conn.execute("SELECT * FROM qa_items WHERE id=?", (qid,)).fetchone()
+    return dict(r)
+
+
+def _fmt_qa_comment_line(c: dict) -> str:
+    """やり取り1件を Excel/HTML 出力用の1行に整形（[MM/DD 名前] 本文）。"""
+    name = c.get("member_name") or c.get("author_name") or "-"
+    dt = (c.get("created_at") or "")[5:10].replace("-", "/")
+    return f"[{dt} {name}] " + (c.get("body") or "").replace("\n", " ")
+
+
+def _qa_thread_lines_db(conn, qa_id: int) -> list:
+    rows = conn.execute(
+        "SELECT c.*, m.name member_name FROM qa_comments c"
+        " LEFT JOIN members m ON m.id=c.author_id"
+        " WHERE c.qa_id=? ORDER BY c.id", (qa_id,)).fetchall()
+    return [_fmt_qa_comment_line(dict(r)) for r in rows]
+
+
+@app.get("/api/qa/{qid}/comments")
+def list_qa_comments(qid: int):
+    with db() as conn:
+        q0 = conn.execute("SELECT project_id FROM qa_items WHERE id=?", (qid,)).fetchone()
+    if q0:
+        external_guard(q0["project_id"], "qa")
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            "SELECT c.*, m.name member_name, m.color member_color FROM qa_comments c"
+            " LEFT JOIN members m ON m.id=c.author_id"
+            " WHERE c.qa_id=? ORDER BY c.id", (qid,)))
+    return rows
+
+
+@app.post("/api/qa/{qid}/comments")
+def add_qa_comment(qid: int, body: dict):
+    actor = resolve_uid(body.get("actor_id"))
+    text = (body.get("body") or "").strip()
+    if not text:
+        raise HTTPException(400, "内容を入力してください")
+    with db() as conn:
+        q = conn.execute("SELECT * FROM qa_items WHERE id=?", (qid,)).fetchone()
+        if not q:
+            raise HTTPException(404, "QA not found")
+        check_role(conn, q["project_id"], actor, {"admin", "member"},
+                   "QAへの記入権限がありません")
+        cur = conn.execute(
+            "INSERT INTO qa_comments(qa_id, author_id, author_name, body, created_at)"
+            " VALUES(?,?,?,?,?)",
+            (qid, actor, (body.get("author_name") or "").strip(), text, now()))
+        conn.execute("UPDATE qa_items SET updated_at=? WHERE id=?", (now(), qid))
+        if q["assignee_id"]:
+            notify(conn, q["assignee_id"], "comment", q["project_id"], None, actor,
+                   f"QA-{q['seq']:03d}「{q['title']}」にやり取りが追加されました")
+        r = conn.execute(
+            "SELECT c.*, m.name member_name, m.color member_color FROM qa_comments c"
+            " LEFT JOIN members m ON m.id=c.author_id WHERE c.id=?",
+            (cur.lastrowid,)).fetchone()
+    return dict(r)
+
+
+@app.delete("/api/qa/comments/{cid}")
+def delete_qa_comment(cid: int, actor_id: Optional[int] = None):
+    actor = resolve_uid(actor_id)
+    with db() as conn:
+        c = conn.execute(
+            "SELECT c.*, q.project_id FROM qa_comments c"
+            " JOIN qa_items q ON q.id=c.qa_id WHERE c.id=?", (cid,)).fetchone()
+        if not c:
+            raise HTTPException(404, "comment not found")
+        if actor is not None and c["author_id"] != actor:
+            check_role(conn, c["project_id"], actor, {"admin"},
+                       "他の人の記録は管理者のみ削除できます")
+        conn.execute("DELETE FROM qa_comments WHERE id=?", (cid,))
+    return {"ok": True}
+
+
+@app.delete("/api/qa/{qid}")
+def delete_qa(qid: int, actor_id: Optional[int] = None):
+    actor = resolve_uid(actor_id)
+    with db() as conn:
+        old = conn.execute("SELECT * FROM qa_items WHERE id=?", (qid,)).fetchone()
+        if not old:
+            raise HTTPException(404, "QA not found")
+        check_role(conn, old["project_id"], actor, {"admin"},
+                   "QAの削除は管理者のみ可能です")
+        conn.execute("DELETE FROM qa_items WHERE id=?", (qid,))
+        record_activity(conn, old["project_id"], None, actor, "delete",
+                        f"QA-{old['seq']:03d}「{old['title']}」")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- API: 課題管理
+
+ISSUE_STATUS_LABEL = {"open": "未対応", "doing": "対応中",
+                      "resolved": "解決済み", "closed": "クローズ"}
+
+
+def _issue_tasks_map(conn, pid):
+    """PJ内の課題ID → 関連タスク [{id,title}] のマップ。"""
+    rows = conn.execute(
+        "SELECT it.issue_id, t.id, t.title FROM issue_tasks it"
+        " JOIN tasks t ON t.id=it.task_id"
+        " WHERE it.issue_id IN (SELECT id FROM issues WHERE project_id=?)"
+        " AND t.deleted_at IS NULL ORDER BY t.sort_order, t.id", (pid,)).fetchall()
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r["issue_id"], []).append({"id": r["id"], "title": r["title"]})
+    return out
+
+
+def _set_issue_tasks(conn, iid, pid, task_ids):
+    """課題の関連タスクを張り替える（同一PJのタスクのみ許可）。"""
+    conn.execute("DELETE FROM issue_tasks WHERE issue_id=?", (iid,))
+    for tid in task_ids or []:
+        ok = conn.execute(
+            "SELECT 1 FROM tasks WHERE id=? AND project_id=? AND deleted_at IS NULL",
+            (tid, pid)).fetchone()
+        if ok:
+            conn.execute("INSERT OR IGNORE INTO issue_tasks(issue_id, task_id)"
+                         " VALUES(?,?)", (iid, tid))
+
+
+@app.get("/api/projects/{pid}/issues-list")
+def list_issues(pid: int):
+    external_guard(pid, "kadai")
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            "SELECT i.*, m.name assignee_name,"
+            " (SELECT COUNT(*) FROM issue_comments c WHERE c.issue_id=i.id) comment_count"
+            " FROM issues i LEFT JOIN members m ON m.id=i.assignee_id"
+            " WHERE i.project_id=? ORDER BY i.seq, i.id", (pid,)))
+        tmap = _issue_tasks_map(conn, pid)
+    for r in rows:
+        r["tasks"] = tmap.get(r["id"], [])
+    return rows
+
+
+@app.post("/api/projects/{pid}/issues-list")
+def create_issue(pid: int, body: dict):
+    actor = resolve_uid(body.get("actor_id"))
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "件名を入力してください")
+    with db() as conn:
+        check_role(conn, pid, actor, {"admin", "member"}, "課題を追加する権限がありません")
+        seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 s FROM issues"
+                           " WHERE project_id=?", (pid,)).fetchone()["s"]
+        cur = conn.execute(
+            "INSERT INTO issues(project_id, seq, title, description, policy,"
+            " action_plan, category, priority, status, assignee_id, raised_by,"
+            " raised_at, due_date, resolved_at, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid, seq, title, body.get("description") or "", body.get("policy") or "",
+             body.get("action_plan") or "", body.get("category") or "",
+             body.get("priority") or "medium", body.get("status") or "open",
+             body.get("assignee_id"), body.get("raised_by") or "",
+             body.get("raised_at") or date.today().isoformat(),
+             body.get("due_date"), body.get("resolved_at"), now(), now()))
+        iid = cur.lastrowid
+        _set_issue_tasks(conn, iid, pid, body.get("task_ids"))
+        record_activity(conn, pid, None, actor, "create", f"課題ISS-{seq:03d}「{title}」")
+        if body.get("assignee_id"):
+            notify(conn, body["assignee_id"], "assign", pid, None, actor,
+                   f"課題ISS-{seq:03d}「{title}」の担当になりました")
+        r = conn.execute("SELECT * FROM issues WHERE id=?", (iid,)).fetchone()
+    return dict(r)
+
+
+@app.patch("/api/issues/{iid}")
+def update_issue(iid: int, body: dict):
+    actor = resolve_uid(body.pop("actor_id", None))
+    allowed = {"title", "description", "policy", "action_plan", "category",
+               "priority", "status", "assignee_id", "raised_by", "raised_at",
+               "due_date", "resolved_at"}
+    data = {k: v for k, v in body.items() if k in allowed}
+    task_ids = body.get("task_ids")
+    if not data and task_ids is None:
+        raise HTTPException(400, "no fields")
+    with db() as conn:
+        old = conn.execute("SELECT * FROM issues WHERE id=?", (iid,)).fetchone()
+        if not old:
+            raise HTTPException(404, "issue not found")
+        check_role(conn, old["project_id"], actor, {"admin", "member"},
+                   "課題を編集する権限がありません")
+        # 解決済み/クローズへ移すと解決日を自動補完、未対応/対応中へ戻すとクリア
+        new_status = data.get("status", old["status"])
+        if new_status in ("resolved", "closed") and \
+                not (data.get("resolved_at") or old["resolved_at"]):
+            data["resolved_at"] = date.today().isoformat()
+        if new_status in ("open", "doing") and "status" in data:
+            data["resolved_at"] = None
+        if data:
+            sets = [f"{k}=?" for k in data] + ["updated_at=?"]
+            conn.execute(f"UPDATE issues SET {', '.join(sets)} WHERE id=?",
+                         list(data.values()) + [now(), iid])
+        if task_ids is not None:
+            _set_issue_tasks(conn, iid, old["project_id"], task_ids)
+        if "assignee_id" in data and data["assignee_id"] and \
+                data["assignee_id"] != old["assignee_id"]:
+            notify(conn, data["assignee_id"], "assign", old["project_id"], None, actor,
+                   f"課題ISS-{old['seq']:03d}「{old['title']}」の担当になりました")
+        if "status" in data and data["status"] != old["status"]:
+            record_activity(conn, old["project_id"], None, actor, "status",
+                            f"課題ISS-{old['seq']:03d}: "
+                            f"{ISSUE_STATUS_LABEL.get(old['status'], '')} → "
+                            f"{ISSUE_STATUS_LABEL.get(data['status'], '')}")
+        r = conn.execute("SELECT * FROM issues WHERE id=?", (iid,)).fetchone()
+    return dict(r)
+
+
+@app.delete("/api/issues/{iid}")
+def delete_issue(iid: int, actor_id: Optional[int] = None):
+    actor = resolve_uid(actor_id)
+    with db() as conn:
+        old = conn.execute("SELECT * FROM issues WHERE id=?", (iid,)).fetchone()
+        if not old:
+            raise HTTPException(404, "issue not found")
+        check_role(conn, old["project_id"], actor, {"admin"},
+                   "課題の削除は管理者のみ可能です")
+        conn.execute("DELETE FROM issues WHERE id=?", (iid,))
+        record_activity(conn, old["project_id"], None, actor, "delete",
+                        f"課題ISS-{old['seq']:03d}「{old['title']}」")
+    return {"ok": True}
+
+
+@app.get("/api/issues/{iid}/comments")
+def list_issue_comments(iid: int):
+    with db() as conn:
+        i0 = conn.execute("SELECT project_id FROM issues WHERE id=?", (iid,)).fetchone()
+    if i0:
+        external_guard(i0["project_id"], "kadai")
+    with db() as conn:
+        rows = rows_to_dicts(conn.execute(
+            "SELECT c.*, m.name member_name, m.color member_color FROM issue_comments c"
+            " LEFT JOIN members m ON m.id=c.author_id"
+            " WHERE c.issue_id=? ORDER BY c.id", (iid,)))
+    return rows
+
+
+@app.post("/api/issues/{iid}/comments")
+def add_issue_comment(iid: int, body: dict):
+    actor = resolve_uid(body.get("actor_id"))
+    text = (body.get("body") or "").strip()
+    if not text:
+        raise HTTPException(400, "内容を入力してください")
+    with db() as conn:
+        i = conn.execute("SELECT * FROM issues WHERE id=?", (iid,)).fetchone()
+        if not i:
+            raise HTTPException(404, "issue not found")
+        check_role(conn, i["project_id"], actor, {"admin", "member"},
+                   "課題への記入権限がありません")
+        cur = conn.execute(
+            "INSERT INTO issue_comments(issue_id, author_id, author_name, body,"
+            " created_at) VALUES(?,?,?,?,?)",
+            (iid, actor, (body.get("author_name") or "").strip(), text, now()))
+        conn.execute("UPDATE issues SET updated_at=? WHERE id=?", (now(), iid))
+        if i["assignee_id"]:
+            notify(conn, i["assignee_id"], "comment", i["project_id"], None, actor,
+                   f"課題ISS-{i['seq']:03d}「{i['title']}」にコメントが追加されました")
+        r = conn.execute(
+            "SELECT c.*, m.name member_name, m.color member_color FROM issue_comments c"
+            " LEFT JOIN members m ON m.id=c.author_id WHERE c.id=?",
+            (cur.lastrowid,)).fetchone()
+    return dict(r)
+
+
+@app.delete("/api/issues/comments/{cid}")
+def delete_issue_comment(cid: int, actor_id: Optional[int] = None):
+    actor = resolve_uid(actor_id)
+    with db() as conn:
+        c = conn.execute(
+            "SELECT c.*, i.project_id FROM issue_comments c"
+            " JOIN issues i ON i.id=c.issue_id WHERE c.id=?", (cid,)).fetchone()
+        if not c:
+            raise HTTPException(404, "comment not found")
+        if actor is not None and c["author_id"] != actor:
+            check_role(conn, c["project_id"], actor, {"admin"},
+                       "他の人のコメントは管理者のみ削除できます")
+        conn.execute("DELETE FROM issue_comments WHERE id=?", (cid,))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- API: Excelインポート（往復運用）
+
+def _xl_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, date):
+        return v.isoformat()
+    return str(v).strip()
+
+
+def _xl_date(v):
+    s = _xl_str(v).replace("/", "-")[:10]
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _xl_progress(v):
+    """0.5（%書式）/ 50 / "50%" のいずれも 0-100 に正規化。"""
+    if v is None or v == "":
+        return None
+    try:
+        n = float(str(v).replace("%", "").strip())
+    except ValueError:
+        return None
+    if 0 < n <= 1:
+        n *= 100
+    return max(0, min(100, round(n)))
+
+
+def _xl_header_map(ws, required):
+    """先頭10行からヘッダー行を探し、(行番号, {見出し: 列}) を返す。"""
+    for r in range(1, min(11, ws.max_row + 1)):
+        names = {}
+        for c in range(1, ws.max_column + 1):
+            v = _xl_str(ws.cell(row=r, column=c).value)
+            if v and v not in names:
+                names[v] = c
+        if all(k in names for k in required):
+            return r, names
+    return None, None
+
+
+def _pick(names, *cands):
+    return next((names[c] for c in cands if c in names), None)
+
+
+def _import_tasks_sheet(conn, pid, wb):
+    """テーブル/WBSガントのExcelを取込。ID列で突合（更新）、ID空行は新規作成。
+    空セルは既存値を保持する。"""
+    ws = next((wb[n] for n in ("テーブル", "WBSガント") if n in wb.sheetnames), wb.active)
+    hr, names = _xl_header_map(ws, ["タスク名"])
+    if not hr:
+        raise HTTPException(400, "ヘッダー行（「タスク名」列）が見つかりません")
+    col = {k: _pick(names, *c) for k, c in {
+        "id": ("ID",), "wbs": ("WBS",), "title": ("タスク名",),
+        "status": ("ステータス",), "assignee": ("担当者", "担当"),
+        "priority": ("優先度",), "start": ("開始", "開始日"), "due": ("期限",),
+        "progress": ("進捗", "進捗%"), "est": ("見積h",), "act": ("実績h",),
+        "tags": ("タグ",)}.items()}
+    smap_by_name = {r["name"]: r["id"] for r in conn.execute(
+        "SELECT id, name FROM statuses WHERE project_id=?", (pid,))}
+    member_by_name = {norm_name(r["name"]): r["id"] for r in conn.execute(
+        "SELECT id, name FROM members WHERE active=1")}
+    prio_rev = {"最優先": "highest", "高": "high", "中": "medium", "低": "low"}
+    cur_tasks = [task_row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM tasks WHERE project_id=? AND deleted_at IS NULL", (pid,))]
+    existing = {t["id"]: t for t in cur_tasks}
+    wbs_to_id = {t["wbs"]: t["id"] for t in build_wbs_rows(cur_tasks)}
+    maps = _status_maps(conn, pid)
+    max_order = conn.execute(
+        "SELECT COALESCE(MAX(sort_order), -1) m FROM tasks WHERE project_id=?",
+        (pid,)).fetchone()["m"]
+    first_status = conn.execute(
+        "SELECT id FROM statuses WHERE project_id=? ORDER BY sort_order LIMIT 1",
+        (pid,)).fetchone()
+    created = updated = skipped = 0
+
+    for r in range(hr + 1, ws.max_row + 1):
+        def g(k):
+            return ws.cell(row=r, column=col[k]).value if col.get(k) else None
+        title = _xl_str(g("title")).lstrip("　").strip()
+        milestone = title.startswith("◆")
+        title = title.lstrip("◆").strip()
+        idv = _xl_str(g("id"))
+        if not title and not idv:
+            continue
+        data = {}
+        if title:
+            data["title"] = title
+        stn = _xl_str(g("status"))
+        if stn in smap_by_name:
+            data["status_id"] = smap_by_name[stn]
+        an = _xl_str(g("assignee"))
+        if an not in ("", "—", "-", "未割当"):
+            mid = member_by_name.get(norm_name(an))
+            if mid:
+                data["assignee_id"] = mid
+        pv = _xl_str(g("priority"))
+        if pv:
+            pk = prio_rev.get(pv, pv if pv in prio_rev.values() else None)
+            if pk:
+                data["priority"] = pk
+        for key, cn in (("start_date", "start"), ("due_date", "due")):
+            dv = _xl_date(g(cn))
+            if dv:
+                data[key] = dv
+        pg = _xl_progress(g("progress"))
+        if pg is not None:
+            data["progress"] = pg
+        for key, cn in (("estimate_h", "est"), ("actual_h", "act")):
+            s = _xl_str(g(cn))
+            try:
+                if s:
+                    data[key] = float(s)
+            except ValueError:
+                pass
+        tg = _xl_str(g("tags"))
+        if tg:
+            data["tags"] = json.dumps(
+                [x.strip() for x in tg.replace("／", "/").split("/") if x.strip()],
+                ensure_ascii=False)
+
+        tid = None
+        if idv:
+            try:
+                tid = int(float(idv))
+            except ValueError:
+                tid = None
+        if tid and tid in existing:
+            old = existing[tid]
+            has_kids = conn.execute(
+                "SELECT 1 FROM tasks WHERE parent_id=? AND deleted_at IS NULL LIMIT 1",
+                (tid,)).fetchone() is not None
+            if has_kids:   # 親タスクの進捗・ステータスは自動算出
+                data.pop("progress", None)
+                data.pop("status_id", None)
+            else:
+                # ステータス⇔進捗の連動: ファイル内で「変更された側」を正として他方を導出
+                # （両列が入っているExcelでは、触っていない側に古い値が残っているため）
+                pg_changed = "progress" in data and data["progress"] != old["progress"]
+                st_changed = ("status_id" in data
+                              and data["status_id"] != old["status_id"])
+                if pg_changed and not st_changed:
+                    data["status_id"] = status_for_progress(
+                        maps, data["progress"], old["status_id"])
+                elif st_changed and not pg_changed:
+                    data["progress"] = progress_for_status(
+                        maps, data["status_id"], old["progress"])
+            if not data:
+                skipped += 1
+                continue
+            sets = [f"{k}=?" for k in data] + ["updated_at=?"]
+            conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?",
+                         list(data.values()) + [now(), tid])
+            updated += 1
+        elif not tid and title:
+            wbs = _xl_str(g("wbs"))
+            parent = wbs_to_id.get(wbs.rsplit(".", 1)[0]) if "." in wbs else None
+            status_id = data.get("status_id") or (
+                status_for_progress(maps, data.get("progress", 0),
+                                    first_status["id"] if first_status else None))
+            max_order += 1
+            cur = conn.execute(
+                "INSERT INTO tasks(project_id, parent_id, title, status_id, assignee_id,"
+                " priority, start_date, due_date, progress, estimate_h, actual_h,"
+                " milestone, tags, deps, custom_values, sort_order, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'[]','{}',?,?,?)",
+                (pid, parent, title, status_id, data.get("assignee_id"),
+                 data.get("priority", "medium"), data.get("start_date"),
+                 data.get("due_date"), data.get("progress", 0),
+                 data.get("estimate_h"), data.get("actual_h"), int(milestone),
+                 data.get("tags", "[]"), max_order, now(), now()))
+            if wbs:
+                wbs_to_id[wbs] = cur.lastrowid
+            created += 1
+        else:
+            skipped += 1   # 不明なID
+    recalc_parent_progress(conn, pid)
+    return {"created": created, "updated": updated, "skipped": skipped}
+
+
+def _import_qa_sheet(conn, pid, wb):
+    """QA管理表のExcelを取込。No列で突合（更新）、No空行は新規作成。
+    空セルは既存値を保持（回答記入で自動「回答済み」）。"""
+    ws = next((wb[n] for n in ("QA管理表", "QA") if n in wb.sheetnames), wb.active)
+    hr, names = _xl_header_map(ws, ["No", "回答"])
+    if not hr:
+        raise HTTPException(400, "ヘッダー行（「No」「回答」列）が見つかりません")
+    col = {k: _pick(names, *c) for k, c in {
+        "seq": ("No",), "category": ("分類",), "qtext": ("件名・質問内容",),
+        "title": ("件名",), "question": ("質問",), "asker": ("質問者",),
+        "asked": ("質問日",), "assignee": ("回答担当",), "due": ("回答期限",),
+        "status": ("ステータス", "状態"), "answer": ("回答",),
+        "answered": ("回答日",), "decision": ("決定事項",),
+        "note": ("備考",), "thread": ("やり取り履歴",)}.items()}
+    st_rev = {v: k for k, v in QA_STATUS_LABEL.items()}
+    member_by_name = {norm_name(r["name"]): r["id"] for r in conn.execute(
+        "SELECT id, name FROM members WHERE active=1")}
+    existing = {r["seq"]: dict(r) for r in conn.execute(
+        "SELECT * FROM qa_items WHERE project_id=?", (pid,))}
+    created = updated = skipped = thread_added = 0
+
+    def import_thread(qa_id, text, fallback_name):
+        """やり取り履歴セルの、DBに無い行だけを新規記録として追加する。
+        行形式 [MM/DD 名前] 本文（形式外の行は fallback_name の発言として扱う）。"""
+        nonlocal thread_added
+        if not text:
+            return
+        ex_lines = set(_qa_thread_lines_db(conn, qa_id))
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line or line in ex_lines:
+                continue
+            m = re.match(r"^[\[［]([^\]］]*)[\]］]\s*(.*)$", line)
+            if m and m.group(2).strip():
+                inside = m.group(1).strip()
+                parts = inside.split(None, 1)
+                name = parts[1] if len(parts) == 2 else inside
+                body_txt = m.group(2).strip()
+            else:
+                name, body_txt = fallback_name or "記入", line
+            conn.execute(
+                "INSERT INTO qa_comments(qa_id, author_name, body, created_at)"
+                " VALUES(?,?,?,?)", (qa_id, name, body_txt, now()))
+            thread_added += 1
+
+    for r in range(hr + 1, ws.max_row + 1):
+        def g(k):
+            return ws.cell(row=r, column=col[k]).value if col.get(k) else None
+        seqs = _xl_str(g("seq")).upper().replace("QA-", "")
+        try:
+            seq = int(float(seqs)) if seqs else None
+        except ValueError:
+            seq = None
+        title = _xl_str(g("title"))
+        question = _xl_str(g("question"))
+        combined = _xl_str(g("qtext"))
+        if combined and not title:
+            parts = combined.split("\n", 1)
+            title = parts[0].strip()
+            question = parts[1].strip() if len(parts) > 1 else ""
+        if not seq and not title:
+            continue
+        data = {}
+        if title:
+            data["title"] = title
+        if question:
+            data["question"] = question
+        for key, cn in (("category", "category"), ("asker_name", "asker"),
+                        ("answer", "answer"), ("decision", "decision"),
+                        ("note", "note")):
+            v = _xl_str(g(cn))
+            if v:
+                data[key] = v
+        for key, cn in (("asked_at", "asked"), ("due_date", "due"),
+                        ("answered_at", "answered")):
+            v = _xl_date(g(cn))
+            if v:
+                data[key] = v
+        stl = _xl_str(g("status"))
+        if stl in st_rev:
+            data["status"] = st_rev[stl]
+        an = _xl_str(g("assignee"))
+        if an:
+            mid = member_by_name.get(norm_name(an))
+            if mid:
+                data["assignee_id"] = mid
+
+        if seq and seq in existing:
+            old = existing[seq]
+            if (data.get("answer", "").strip() and old["status"] == "open"
+                    and data.get("status", "open") == "open"):
+                data["status"] = "answered"
+            if data.get("status") == "answered" and \
+                    not (data.get("answered_at") or old["answered_at"]):
+                data["answered_at"] = date.today().isoformat()
+            if not data:
+                skipped += 1
+                continue
+            sets = [f"{k}=?" for k in data] + ["updated_at=?"]
+            conn.execute(f"UPDATE qa_items SET {', '.join(sets)} WHERE id=?",
+                         list(data.values()) + [now(), old["id"]])
+            import_thread(old["id"], _xl_str(g("thread")),
+                          data.get("asker_name") or old["asker_name"])
+            updated += 1
+        elif title:
+            if not seq or seq in existing:
+                seq = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 s FROM qa_items"
+                    " WHERE project_id=?", (pid,)).fetchone()["s"]
+            if data.get("answer", "").strip() and data.get("status", "open") == "open":
+                data["status"] = "answered"
+                data.setdefault("answered_at", date.today().isoformat())
+            conn.execute(
+                "INSERT INTO qa_items(project_id, seq, title, question, answer,"
+                " decision, note, category, status, asker_name, assignee_id,"
+                " asked_at, due_date, answered_at, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, seq, title, data.get("question", ""), data.get("answer", ""),
+                 data.get("decision", ""), data.get("note", ""),
+                 data.get("category", ""), data.get("status", "open"),
+                 data.get("asker_name", ""), data.get("assignee_id"),
+                 data.get("asked_at") or date.today().isoformat(),
+                 data.get("due_date"), data.get("answered_at"), now(), now()))
+            new_id = conn.execute("SELECT last_insert_rowid() i").fetchone()["i"]
+            import_thread(new_id, _xl_str(g("thread")), data.get("asker_name"))
+            existing[seq] = {"id": new_id}
+            created += 1
+        else:
+            skipped += 1
+    return {"created": created, "updated": updated, "skipped": skipped,
+            "thread_added": thread_added}
+
+
+@app.post("/api/projects/{pid}/import/xlsx")
+async def import_xlsx(pid: int, request: Request, kind: str = "tasks",
+                      actor_id: Optional[int] = None):
+    """エクスポートしたExcel（テーブル/WBSガント/QA管理表）を取り込む往復運用。
+    突合キー: タスク=ID列 / QA=No列。キーが空の行は新規作成、空セルは既存値を保持。"""
+    actor = resolve_uid(actor_id)
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(400, "ファイルが空です")
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(io.BytesIO(raw), data_only=True)
+    except Exception:
+        raise HTTPException(400, "Excelファイル（.xlsx）を読み込めませんでした")
+    with db() as conn:
+        check_role(conn, pid, actor, {"admin"}, "インポートは管理者のみ実行できます")
+        if kind == "qa":
+            result = _import_qa_sheet(conn, pid, wb)
+        else:
+            result = _import_tasks_sheet(conn, pid, wb)
+        record_activity(conn, pid, None, actor, "create",
+                        f"Excel取込（{'QA' if kind == 'qa' else 'タスク'}）:"
+                        f" 更新{result['updated']}件・追加{result['created']}件")
+    return result
 
 
 # ---------------------------------------------------------------- API: CSVインポート
@@ -3495,6 +4848,7 @@ def latest_baseline(pid: int):
 
 @app.get("/api/projects/{pid}/metrics")
 def project_metrics(pid: int):
+    external_guard(pid, "dashboard")
     today = date.today()
     with db() as conn:
         statuses = list(conn.execute(

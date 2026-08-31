@@ -113,7 +113,8 @@ function cardHtml(t, smap, byStatus) {
   const dueCls = U.dueClass(t, smap);
   const draggable = byStatus ? canEditField(t, 'status_id') : canEditField(t, 'assignee_id');
   return `<div class="card ${dueCls === 'overdue' ? 'overdue' : ''} ${draggable ? '' : 'no-drag'}" draggable="${draggable}" data-id="${t.id}">
-    <div class="card-title">${t.milestone ? '<span class="msdiamond">◆</span> ' : ''}${U.esc(taskLabel(t))}</div>
+    <div class="card-title">${t.milestone ? '<span class="msdiamond">◆</span> ' : ''}${U.esc(taskLabel(t))}
+      ${t.issue_count ? `<span class="issue-chip" title="オープンの関連課題 ${t.issue_count} 件">📌${t.issue_count}</span>` : ''}</div>
     <div class="card-meta">
       ${fieldVisible('priority') ? U.prioHtml(t.priority) : ''}
       ${!byStatus && st ? `<span class="badge" style="background:${U.esc(st.color)}">${U.esc(st.name)}</span>` : ''}
@@ -228,6 +229,11 @@ function renderTable(container) {
 
   const bulk = canManageProject();
   container.innerHTML = `
+  <div class="table-toolbar">
+    <span class="spacer"></span>
+    ${bulk ? '<button class="btn sm" id="tbl-imp" title="エクスポートしたExcelを取り込んで更新・追加（ID列で突合、ID空行は新規）">📥 Excel取込</button>' : ''}
+    <button class="btn sm" id="tbl-exp" title="整形済みテーブルExcelを出力（取込での往復に対応）">📗 Excel出力</button>
+  </div>
   ${bulk ? `<div id="bulk-bar" class="bulk-bar hidden">
       <b><span id="bulk-count">0</span> 件選択中</b>
       <select id="bulk-status"><option value="">ステータス変更…</option>
@@ -255,6 +261,9 @@ function renderTable(container) {
   ${rows.length === 0 ? '<div class="empty-note">条件に合うタスクがありません</div>' : ''}
   </div>`;
 
+  const tblImp = container.querySelector('#tbl-imp');
+  if (tblImp) tblImp.onclick = () => importViewXlsx('tasks');
+  container.querySelector('#tbl-exp').onclick = () => exportViewXlsx('table');
   container.querySelectorAll('th[data-sort]').forEach(el => {
     el.addEventListener('click', () => {
       const k = el.dataset.sort;
@@ -362,7 +371,8 @@ function tableRowHtml(t, smap, mmap, cfDefs, vis, bulk) {
     ${vis.est ? `<td><input type="number" data-edit="estimate_h" value="${t.estimate_h ?? ''}" min="0" step="0.5" style="width:56px" ${dis('estimate_h')}></td>` : ''}
     ${vis.tags ? `<td>${t.tags.map(tg => `<span class="tag-chip">${U.esc(tg)}</span>`).join(' ')}</td>` : ''}
     ${cfDefs.map(f => `<td>${U.esc(t.custom_values[f.key] ?? '')}</td>`).join('')}
-    <td>${t.comment_count ? `💬${t.comment_count}` : ''}</td>
+    <td>${t.comment_count ? `💬${t.comment_count}` : ''}
+      ${t.issue_count ? `<span class="issue-chip" title="オープンの関連課題 ${t.issue_count} 件">📌${t.issue_count}</span>` : ''}</td>
   </tr>`;
 }
 
@@ -533,6 +543,8 @@ function renderGantt(container) {
     <button class="btn sm" id="g-zoom-in" title="拡大">＋</button>
     <button class="btn sm" id="g-zoom-fit">全体表示</button>
     ${editable ? '<button class="btn sm" id="g-baseline" title="現在の日程を基準線として保存">📏 基準線保存</button>' : ''}
+    ${editable ? '<button class="btn sm" id="g-import" title="WBSガントExcelを取り込み（ID列で突合・ID空行は新規追加）">📥 取込</button>' : ''}
+    <button class="btn sm" id="g-export" title="Excelガントチャートを出力（取込での往復に対応）">📗 出力</button>
     ${State.baseline && Object.keys(State.baseline).length ? '<span class="tag-chip" title="灰色の細いバーが基準線（保存時点の計画）">基準線表示中</span>' : ''}
     ${G.edit ? `<span class="g-help" title="バー中央ドラッグ＝日程移動
 左端＝開始日のみ・右端＝期限のみ変更
@@ -660,6 +672,9 @@ function renderGantt(container) {
   const rerender = () => renderGantt(container);
   const et = container.querySelector('#g-edit-toggle');
   if (et) et.onclick = () => { G.edit = !G.edit; rerender(); };
+  const gi = container.querySelector('#g-import');
+  if (gi) gi.onclick = () => importViewXlsx('tasks');
+  container.querySelector('#g-export').onclick = () => exportViewXlsx('gantt');
   container.querySelector('#g-zoom-out').onclick = () => { G.dayW = Math.max(6, G.dayW - 4); rerender(); };
   container.querySelector('#g-zoom-in').onclick = () => { G.dayW = Math.min(48, G.dayW + 4); rerender(); };
   // 基準線の遅延読込・保存
@@ -852,24 +867,78 @@ function setupGanttInteractions(container, ctx) {
 /* =====================================================================
  *  ダッシュボード（ウィジェット方式・ユーザーごとに表示/配置をカスタマイズ可能）
  * =================================================================== */
+/* [id, ラベル, 既定幅(12分割グリッドのカラム数), 既定高さ(1行=40pxのユニット数)] */
 const DASH_WIDGETS = [
-  ['stat_total', '📋 タスク総数'], ['stat_done', '✅ 完了'],
-  ['stat_overdue', '⚠ 期限超過'], ['stat_avg', '📈 平均進捗'],
-  ['status_donut', '🍩 ステータス別'], ['member_bar', '👥 担当者別残タスク'],
-  ['priority_bar', '🔺 優先度別'], ['week_load', '📅 週別負荷'],
-  ['deadlines', '⏰ 期限が近いタスク'], ['mini_board', '🗂 簡易ボード'],
-  ['activity', '📰 アクティビティ'], ['burndown', '📉 バーンダウン'],
-  ['risks', '🚨 リスクタスク'], ['effort', '⏱ 工数'], ['report', '📄 レポート'],
+  ['stat_total', '📋 タスク総数', 3, 3], ['stat_done', '✅ 完了', 3, 3],
+  ['stat_overdue', '⚠ 期限超過', 3, 3], ['stat_avg', '📈 平均進捗', 3, 3],
+  ['status_donut', '🍩 ステータス別', 4, 7], ['member_bar', '👥 担当者別残タスク', 4, 7],
+  ['priority_bar', '🔺 優先度別', 4, 7], ['week_load', '📅 週別負荷', 8, 6],
+  ['deadlines', '⏰ 期限が近いタスク', 4, 8], ['mini_board', '🗂 簡易ボード', 8, 7],
+  ['activity', '📰 アクティビティ', 4, 8], ['burndown', '📉 バーンダウン', 6, 7],
+  ['risks', '🚨 リスクタスク', 6, 7], ['effort', '⏱ 工数', 6, 7], ['report', '📄 レポート', 6, 4],
 ];
+const DASH_CELL = 40;   // 1行の高さ(px)
 
-function dashLayout() {
-  const all = DASH_WIDGETS.map(w => w[0]);
-  let ids = (Array.isArray(State.prefs.dash_layout) && State.prefs.dash_layout.length)
-    ? State.prefs.dash_layout.filter(id => all.includes(id))
-    : all;
+/* 位置未指定のウィジェット列を左上から順に空きへ配置（初期配置・旧形式の移行用） */
+function packDash(list) {
+  const colY = Array(12).fill(0);
+  return list.map(it => {
+    let best = { x: 0, y: Infinity };
+    for (let x = 0; x <= 12 - it.w; x++) {
+      const y = Math.max(...colY.slice(x, x + it.w));
+      if (y < best.y) best = { x, y };
+    }
+    for (let x = best.x; x < best.x + it.w; x++) colY[x] = best.y + it.h;
+    return { ...it, x: best.x, y: best.y };
+  });
+}
+
+/* レイアウト＝ [{id, x(0-11), y(行), w(2-12), h(行数)}] の自由配置。
+   旧形式（id文字列の配列 / {id,w,h} で h=''|s|m|l|px）は初回に自動移行する */
+function dashLayoutItems() {
+  const meta = Object.fromEntries(DASH_WIDGETS.map(([id, label, w, h]) => [id, { label, w, h }]));
+  const saved = State.prefs.dash_layout;
+  const normW = (w, def) => {
+    const n = Math.round(Number(w));
+    return (Number.isFinite(n) && n >= 2 && n <= 12) ? n : def;
+  };
+  const normH = (h, def) => {
+    if (h === 's') return 5;
+    if (h === 'm') return 8;
+    if (h === 'l') return 12;
+    const n = Number(h);
+    if (!Number.isFinite(n) || n <= 0) return def;
+    // 旧形式はpx、新形式は行数（30以下は行数とみなす）
+    return Math.max(2, Math.min(24, n > 30 ? Math.round(n / DASH_CELL) : Math.round(n)));
+  };
+  let items;
+  if (Array.isArray(saved) && saved.length) {
+    const arr = saved.map(it => (typeof it === 'string' ? { id: it } : { ...it }))
+      .filter(it => meta[it.id]);
+    if (arr.length && arr.every(it => Number.isFinite(Number(it.x)) && Number.isFinite(Number(it.y)))) {
+      items = arr.map(it => {
+        const w = normW(it.w, meta[it.id].w);
+        return { id: it.id, w, h: normH(it.h, meta[it.id].h),
+          x: Math.max(0, Math.min(12 - w, Math.round(Number(it.x)))),
+          y: Math.max(0, Math.min(500, Math.round(Number(it.y)))) };
+      });
+    } else {
+      items = packDash(arr.map(it => ({ id: it.id, w: normW(it.w, meta[it.id].w),
+        h: normH(it.h, meta[it.id].h) })));
+    }
+  } else {
+    items = packDash(DASH_WIDGETS.map(([id, , w, h]) => ({ id, w, h })));
+  }
   // 優先度を非表示にしたPJでは優先度ウィジェットを出さない
-  if (!fieldVisible('priority')) ids = ids.filter(id => id !== 'priority_bar');
-  return ids;
+  if (!fieldVisible('priority')) items = items.filter(it => it.id !== 'priority_bar');
+  return items;
+}
+
+async function saveDashLayout(items) {
+  State.prefs.dash_layout = items;
+  try {
+    await API.setPref(State.currentUserId, 'dash_layout', items);
+  } catch (e) { toast(e.message); }
 }
 
 function renderDashboard(container) {
@@ -981,13 +1050,35 @@ function renderDashboard(container) {
     <a class="btn sm" href="/api/projects/${State.pid}/calendar.ics" download
       style="text-decoration:none;display:inline-block;margin-left:6px">📅 iCal（Outlook購読用）</a></div>`;
 
-  const layout = dashLayout();
+  const items = dashLayoutItems();
+  const edit = !!State.dashEdit;
+  const labelOf = Object.fromEntries(DASH_WIDGETS.map(([id, label]) => [id, label]));
+  const itemHtml = (it) => `
+    <div class="dash-item ${edit ? 'editing' : ''}"
+         data-wid="${it.id}" data-x="${it.x}" data-y="${it.y}" data-w="${it.w}" data-h="${it.h}"
+         style="left:${it.x / 12 * 100}%;top:${it.y * DASH_CELL}px;width:${it.w / 12 * 100}%;height:${it.h * DASH_CELL}px">
+      ${edit ? `<div class="dash-item-tools">
+        <span class="dash-grip" title="ドラッグで移動">⠿</span>
+        <span class="dash-item-name">${labelOf[it.id] || it.id}</span>
+        <button class="icon-btn" data-remove title="このウィジェットを外す">✕</button>
+      </div>
+      <span class="dash-rs dash-rs-r" title="ドラッグで幅変更"></span>
+      <span class="dash-rs dash-rs-b" title="ドラッグで高さ変更"></span>
+      <span class="dash-rs dash-rs-c" title="ドラッグでサイズ変更"></span>` : ''}
+      ${W[it.id] || ''}
+    </div>`;
+  const gridH = (Math.max(0, ...items.map(it => it.y + it.h)) + (edit ? 6 : 0)) * DASH_CELL;
   container.innerHTML = `
     <div class="dash-toolbar">
+      ${edit ? `<span class="tag-chip">レイアウト編集中 — バー掴んで移動 / 縁ドラッグでサイズ変更 / ✕で削除。好きな位置に自由配置できます（自分の画面にのみ反映）</span>` : ''}
       <span class="spacer"></span>
-      <button class="btn sm ghost" id="dash-customize" title="このダッシュボードに表示する項目と並び順を変更（自分の画面にのみ反映）">⚙ 表示カスタマイズ</button>
+      ${edit ? `
+        <button class="btn sm" id="dash-add">＋ ウィジェット追加</button>
+        <button class="btn sm" id="dash-reset" title="既定の配置に戻す">↺ 初期配置</button>
+        <button class="btn sm primary" id="dash-done">✔ 完了</button>`
+      : `<button class="btn sm ghost" id="dash-customize" title="ウィジェットの追加・削除・サイズ・配置を編集（自分の画面にのみ反映）">⚙ 編集</button>`}
     </div>
-    <div class="dash">${layout.map(id => W[id] || '').join('')}</div>`;
+    <div class="dash free ${edit ? 'editing' : ''}" id="dash-grid" style="height:${gridH}px">${items.map(itemHtml).join('')}</div>`;
 
   container.querySelectorAll('[data-open]').forEach(el => {
     el.addEventListener('click', () => openDetail(Number(el.dataset.open)));
@@ -996,7 +1087,8 @@ function renderDashboard(container) {
   container.querySelectorAll('[data-go]').forEach(el => {
     el.addEventListener('click', () => goTableFiltered(el.dataset.go));
   });
-  container.querySelector('#dash-customize').onclick = openDashCustomizeModal;
+  if (edit) setupDashEdit(container, items);
+  else container.querySelector('#dash-customize').onclick = () => { State.dashEdit = true; render(); };
   const sumBtn = container.querySelector('#dash-summary');
   if (sumBtn) sumBtn.onclick = async () => {
     sumBtn.disabled = true;
@@ -1006,59 +1098,130 @@ function renderDashboard(container) {
     } catch (err) { toast(err.message); }
     sumBtn.disabled = false;
   };
-  if (layout.some(id => ['burndown', 'risks', 'effort'].includes(id))) {
+  if (items.some(it => ['burndown', 'risks', 'effort'].includes(it.id))) {
     loadDashboardMetrics(container);
   }
 }
 
-/* ダッシュボードの表示カスタマイズ（表示ユーザーごとに保存） */
-function openDashCustomizeModal() {
-  const current = dashLayout();
-  const all = DASH_WIDGETS.filter(([id]) => id !== 'priority_bar' || fieldVisible('priority'));
-  // 現在の並び順（表示中）＋非表示のもの
-  const ordered = [...current.map(id => all.find(w => w[0] === id)).filter(Boolean),
-                   ...all.filter(w => !current.includes(w[0]))];
-  showModal(`
-    <h2>⚙ ダッシュボードの表示カスタマイズ</h2>
-    <p style="color:var(--muted);font-size:12.5px;margin:0 0 10px">
-      チェック=表示、↑↓=並び順。この設定は<b>あなたの画面にのみ</b>反映されます。</p>
-    <div id="dc-list">${ordered.map(([id, label]) => `
-      <div class="status-edit-row" data-wid="${id}">
-        <input type="checkbox" ${current.includes(id) ? 'checked' : ''}>
-        <span style="flex:1">${label}</span>
-        <button class="icon-btn" data-up>↑</button>
-        <button class="icon-btn" data-down>↓</button>
-      </div>`).join('')}</div>
-    <div class="modal-actions">
-      <button class="btn left" id="dc-reset">既定に戻す</button>
-      <button class="btn" data-close>キャンセル</button>
-      <button class="btn primary" id="dc-save">保存</button>
-    </div>`);
-  const list = document.getElementById('dc-list');
-  list.querySelectorAll('[data-up]').forEach(b => b.onclick = () => {
-    const row = b.closest('[data-wid]');
-    if (row.previousElementSibling) row.parentElement.insertBefore(row, row.previousElementSibling);
-  });
-  list.querySelectorAll('[data-down]').forEach(b => b.onclick = () => {
-    const row = b.closest('[data-wid]');
-    if (row.nextElementSibling) row.parentElement.insertBefore(row.nextElementSibling, row);
-  });
-  document.getElementById('dc-save').onclick = async () => {
-    const ids = [...list.querySelectorAll('[data-wid]')]
-      .filter(r => r.querySelector('input').checked)
-      .map(r => r.dataset.wid);
-    State.prefs.dash_layout = ids;
-    await API.setPref(State.currentUserId, 'dash_layout', ids);
-    closeModal();
-    render();
-    toast('ダッシュボードの表示を保存しました');
+/* ---- ダッシュボードのレイアウト編集モード（NetBox/Zabbix風） ---- */
+function setupDashEdit(container, items) {
+  const grid = container.querySelector('#dash-grid');
+  const readItem = (el) => ({ id: el.dataset.wid, x: +el.dataset.x, y: +el.dataset.y,
+                             w: +el.dataset.w, h: +el.dataset.h });
+  const currentItems = () => [...grid.querySelectorAll('.dash-item')].map(readItem);
+  const save = () => saveDashLayout(currentItems());
+  const applyPos = (el) => {
+    el.style.left = `${el.dataset.x / 12 * 100}%`;
+    el.style.top = `${el.dataset.y * DASH_CELL}px`;
+    el.style.width = `${el.dataset.w / 12 * 100}%`;
+    el.style.height = `${el.dataset.h * DASH_CELL}px`;
   };
-  document.getElementById('dc-reset').onclick = async () => {
+  const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w &&
+                             a.y < b.y + b.h && b.y < a.y + a.h;
+  const collides = (el) => {
+    const me = readItem(el);
+    return [...grid.querySelectorAll('.dash-item')].some(o => o !== el && overlaps(me, readItem(o)));
+  };
+  const growGrid = () => {
+    const maxB = Math.max(0, ...currentItems().map(it => it.y + it.h));
+    grid.style.height = `${(maxB + 6) * DASH_CELL}px`;
+  };
+
+  // 移動（バー掴み）とサイズ変更（縁ドラッグ）: 自由配置＝詰め直しはしない。重なる場合のみ元に戻す
+  const drag = (el, mode) => (e) => {   // mode: move / r(幅) / b(高さ) / c(両方)
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const s = readItem(el);
+    const sx = e.clientX, sy = e.clientY;
+    const colPx = grid.clientWidth / 12;
+    document.body.classList.add('dash-resizing');
+    el.classList.add(mode === 'move' ? 'dragging' : 'resizing');
+    const move = (ev) => {
+      const dx = Math.round((ev.clientX - sx) / colPx);
+      const dy = Math.round((ev.clientY - sy) / DASH_CELL);
+      if (mode === 'move') {
+        el.dataset.x = Math.max(0, Math.min(12 - s.w, s.x + dx));
+        el.dataset.y = Math.max(0, s.y + dy);
+      } else {
+        if (mode !== 'b') el.dataset.w = Math.max(2, Math.min(12 - s.x, s.w + dx));
+        if (mode !== 'r') el.dataset.h = Math.max(2, Math.min(24, s.h + dy));
+      }
+      applyPos(el);
+      growGrid();
+      el.classList.toggle('collide', collides(el));
+    };
+    const up = async () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.classList.remove('dash-resizing');
+      el.classList.remove('dragging', 'resizing');
+      if (collides(el)) {
+        Object.assign(el.dataset, { x: s.x, y: s.y, w: s.w, h: s.h });
+        applyPos(el);
+        el.classList.remove('collide');
+        toast('他のウィジェットと重なるため元の位置に戻しました');
+      }
+      growGrid();
+      await save();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  };
+
+  grid.querySelectorAll('.dash-item').forEach(el => {
+    el.querySelector('[data-remove]').onclick = async () => {
+      el.remove();
+      growGrid();
+      await save();
+    };
+    // 上部バー全体で移動（✕ボタンは除く）
+    el.querySelector('.dash-item-tools').addEventListener('mousedown', (e) => {
+      if (e.target.closest('button')) return;
+      drag(el, 'move')(e);
+    });
+    el.querySelector('.dash-rs-r').addEventListener('mousedown', drag(el, 'r'));
+    el.querySelector('.dash-rs-b').addEventListener('mousedown', drag(el, 'b'));
+    el.querySelector('.dash-rs-c').addEventListener('mousedown', drag(el, 'c'));
+  });
+
+  container.querySelector('#dash-done').onclick = () => { State.dashEdit = false; render(); };
+  container.querySelector('#dash-reset').onclick = async () => {
+    if (!confirm('ウィジェットの配置・サイズを既定に戻しますか？')) return;
     delete State.prefs.dash_layout;
     await API.setPref(State.currentUserId, 'dash_layout', null);
-    closeModal();
     render();
-    toast('既定の表示に戻しました');
+    toast('既定の配置に戻しました');
+  };
+  container.querySelector('#dash-add').onclick = () => {
+    const shown = new Set(currentItems().map(it => it.id));
+    const hidden = DASH_WIDGETS.filter(([id]) =>
+      !shown.has(id) && (id !== 'priority_bar' || fieldVisible('priority')));
+    if (!hidden.length) { toast('追加できるウィジェットはありません（すべて表示中）'); return; }
+    showModal(`
+      <h2>＋ ウィジェットを追加</h2>
+      <div id="da-list">${hidden.map(([id, label]) => `
+        <div class="status-edit-row" style="cursor:pointer" data-add="${id}">
+          <span style="flex:1">${label}</span><span class="tag-chip">追加</span>
+        </div>`).join('')}</div>
+      <div class="modal-actions"><button class="btn" data-close>閉じる</button></div>`);
+    document.querySelectorAll('#da-list [data-add]').forEach(row => {
+      row.onclick = async () => {
+        const def = DASH_WIDGETS.find(([i]) => i === row.dataset.add);
+        const cur = currentItems();
+        // 空いている場所（左上から走査）に配置する
+        let pos = null;
+        for (let y = 0; y <= 500 && !pos; y++) {
+          for (let x = 0; x <= 12 - def[2]; x++) {
+            const cand = { x, y, w: def[2], h: def[3] };
+            if (!cur.some(o => overlaps(cand, o))) { pos = { x, y }; break; }
+          }
+        }
+        await saveDashLayout([...cur, { id: def[0], w: def[2], h: def[3], ...pos }]);
+        closeModal();
+        render();
+      };
+    });
   };
 }
 
@@ -1651,6 +1814,729 @@ function renderCalendar(container) {
 }
 
 /* =====================================================================
+ *  QAビュー（質問管理表。顧客とのQ&Aを管理し、顧客提出用に出力できる）
+ * =================================================================== */
+const QA_STATUS = [['open', '回答待ち', '#e05252'], ['pending', '保留', '#f59e0b'],
+                   ['answered', '回答済み', '#4f6ef7'], ['closed', 'クローズ', '#16a34a']];
+const qaNo = (q) => `QA-${String(q.seq).padStart(3, '0')}`;
+
+async function renderQa(container) {
+  container.innerHTML = '<div class="empty-note">読み込み中…</div>';
+  let items = [];
+  try { items = await API.qaList(State.pid); } catch (e) {
+    container.innerHTML = `<div class="empty-note">${U.esc(e.message)}</div>`;
+    return;
+  }
+  State.qaItems = items;
+  if (!State.qaFilter) State.qaFilter = { status: '', kw: '' };
+  drawQaView(container);
+}
+
+function drawQaView(container) {
+  const f = State.qaFilter;
+  const stMap = Object.fromEntries(QA_STATUS.map(([k, l, c]) => [k, { l, c }]));
+  const items = State.qaItems.filter(q =>
+    (!f.status || q.status === f.status) &&
+    (!f.kw || `${q.title} ${q.question} ${q.answer} ${q.decision || ''} ${q.note || ''} ${q.category || ''} ${q.asker_name || ''}`
+      .toLowerCase().includes(f.kw.toLowerCase())));
+  const today = U.todayStr();
+  const openCnt = State.qaItems.filter(q => q.status === 'open').length;
+  container.innerHTML = `
+  <div class="qa-toolbar">
+    ${canCreateTask() ? '<button class="btn primary sm" id="qa-add">＋ QA追加</button>' : ''}
+    <select id="qa-fstatus"><option value="">状態: すべて</option>
+      ${QA_STATUS.map(([k, l]) => `<option value="${k}" ${f.status === k ? 'selected' : ''}>${l}</option>`).join('')}
+    </select>
+    <input type="search" id="qa-kw" placeholder="🔍 キーワード" value="${U.esc(f.kw)}">
+    <span class="tag-chip">全 ${State.qaItems.length} 件 ／ 回答待ち <b style="color:var(--danger)">${openCnt}</b> 件</span>
+    <span class="spacer"></span>
+    ${canManageProject() ? '<button class="btn sm" id="qa-imp" title="QA管理表Excelを取り込み（No列で突合・回答記入で自動回答済み・No空行は新規追加）">📥 Excel取込</button>' : ''}
+    <button class="btn sm" id="qa-exp-x" title="整形済みのQA管理表Excelを出力（顧客提出→取込の往復に対応）">📗 Excel出力</button>
+    <button class="btn sm" id="qa-exp-h" title="この一覧を単一HTMLで出力">📄 HTML出力</button>
+  </div>
+  <div class="qa-wrap"><table class="qa-table">
+    <thead><tr><th>No</th><th>分類</th><th>件名・質問</th><th>質問者</th><th>質問日</th>
+      <th>回答担当</th><th>回答期限</th><th>状態</th><th>回答</th><th>回答日</th>
+      <th>決定事項</th><th>備考</th></tr></thead>
+    <tbody>${items.map(q => {
+      const overdue = q.due_date && ['open', 'pending'].includes(q.status) && q.due_date < today;
+      const st = stMap[q.status] || { l: q.status, c: '#8b95a7' };
+      return `<tr data-qid="${q.id}">
+        <td class="qa-no">${qaNo(q)}</td>
+        <td>${q.category ? `<span class="tag-chip">${U.esc(q.category)}</span>` : ''}</td>
+        <td class="qa-q"><b>${U.esc(q.title)}</b>${q.comment_count ? ` <span class="tag-chip" title="やり取り ${q.comment_count} 件">💬${q.comment_count}</span>` : ''}${q.question ? `<div class="qa-detail">${U.esc(q.question)}</div>` : ''}
+          ${q.task_id ? `<div class="qa-detail">🔗 ${U.esc(wbsOf(q.task_id) ? wbsOf(q.task_id) + ' ' : '')}${U.esc(q.task_title || '')}</div>` : ''}</td>
+        <td>${U.esc(q.asker_name || '—')}</td>
+        <td class="qa-date">${U.esc((q.asked_at || '').slice(5))}</td>
+        <td>${U.esc(q.assignee_name || '—')}</td>
+        <td class="qa-date ${overdue ? 'qa-overdue' : ''}">${U.esc((q.due_date || '').slice(5))}${overdue ? ' ⚠' : ''}</td>
+        <td><span class="badge" style="background:${st.c}">${st.l}</span></td>
+        <td class="qa-a">${U.esc(q.answer || '')}</td>
+        <td class="qa-date">${U.esc((q.answered_at || '').slice(5))}</td>
+        <td class="qa-a qa-decision">${U.esc(q.decision || '')}</td>
+        <td class="qa-a qa-note">${U.esc(q.note || '')}</td></tr>`;
+    }).join('') || `<tr><td colspan="12"><div class="empty-note">QAはまだありません${canCreateTask() ? '。「＋QA追加」から登録できます' : ''}</div></td></tr>`}
+    </tbody></table></div>`;
+
+  const fs = container.querySelector('#qa-fstatus');
+  fs.onchange = () => { f.status = fs.value; drawQaView(container); };
+  const kw = container.querySelector('#qa-kw');
+  kw.oninput = U.debounce(() => {
+    f.kw = kw.value;
+    drawQaView(container);
+    const el = container.querySelector('#qa-kw');
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, 300);
+  const add = container.querySelector('#qa-add');
+  if (add) add.onclick = () => openQaModal();
+  container.querySelectorAll('tr[data-qid]').forEach(tr => {
+    tr.onclick = () => openQaModal(State.qaItems.find(x => x.id === Number(tr.dataset.qid)));
+  });
+  container.querySelector('#qa-exp-x').onclick = () => exportViewXlsx('qa');
+  container.querySelector('#qa-exp-h').onclick = () => exportViewHtml('qa');
+  const qaImp = container.querySelector('#qa-imp');
+  if (qaImp) qaImp.onclick = () => importViewXlsx('qa');
+}
+
+function openQaModal(q = null) {
+  showModal(`
+    <h2>${q ? `${qaNo(q)} の編集` : '＋ QAを追加'}</h2>
+    <div class="form-row"><label>件名 *</label><input id="qam-title" value="${U.esc(q ? q.title : '')}" autofocus></div>
+    <div class="form-cols">
+      <div class="form-row"><label>分類</label><input id="qam-cat" value="${U.esc(q ? q.category || '' : '')}" placeholder="仕様 / 環境 / データ など"></div>
+      <div class="form-row"><label>質問者</label><input id="qam-asker" value="${U.esc(q ? q.asker_name || '' : (State.loginUser ? State.loginUser.name : ''))}" placeholder="顧客名・担当者名"></div>
+      <div class="form-row"><label>質問日</label><input type="date" id="qam-asked" value="${U.esc(q ? q.asked_at || '' : U.todayStr())}"></div>
+      <div class="form-row"><label>回答期限</label><input type="date" id="qam-due" value="${U.esc(q ? q.due_date || '' : '')}"></div>
+      <div class="form-row"><label>回答担当</label>
+        <select id="qam-assignee"><option value="">未定</option>
+          ${State.members.map(m => `<option value="${m.id}" ${q && q.assignee_id === m.id ? 'selected' : ''}>${U.esc(m.name)}</option>`).join('')}
+        </select></div>
+      <div class="form-row"><label>ステータス</label>
+        <select id="qam-status">${QA_STATUS.map(([k, l]) =>
+          `<option value="${k}" ${(q ? q.status : 'open') === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <div class="form-row"><label>関連タスク</label>
+        <select id="qam-task"><option value="">（なし）</option>
+          ${buildWbs(State.tasks).map(t => `<option value="${t.id}" ${q && q.task_id === t.id ? 'selected' : ''}>${U.esc(taskLabel(t))}</option>`).join('')}
+        </select></div>
+    </div>
+    <div class="form-row"><label>質問の詳細</label><textarea id="qam-question" rows="4">${U.esc(q ? q.question || '' : '')}</textarea></div>
+    <div class="form-row"><label>回答（記入すると自動で「回答済み」になります）</label>
+      <textarea id="qam-answer" rows="4">${U.esc(q ? q.answer || '' : '')}</textarea></div>
+    <div class="form-cols">
+      <div class="form-row"><label>決定事項</label>
+        <textarea id="qam-decision" rows="3" placeholder="このQAで確定した内容">${U.esc(q ? q.decision || '' : '')}</textarea></div>
+      <div class="form-row"><label>備考</label>
+        <textarea id="qam-note" rows="3" placeholder="補足・経緯メモなど">${U.esc(q ? q.note || '' : '')}</textarea></div>
+    </div>
+    ${q ? `<div class="form-row"><label>やり取り履歴（再質問・再回答を時系列で記録。Excel出力・取込にも対応）</label>
+      <div id="qam-thread" class="qa-thread"><div class="empty-note" style="padding:8px">読み込み中…</div></div>
+      ${canCreateTask() ? `<div style="display:flex;gap:8px;margin-top:6px">
+        <textarea id="qam-newcomment" rows="2" placeholder="例: 顧客から再質問あり「〜」／ 一次回答を送付 など（Ctrl+Enterで記録）" style="flex:1"></textarea>
+        <button class="btn sm primary" id="qam-post" style="align-self:flex-end">記録</button>
+      </div>` : ''}</div>` : ''}
+    <div class="modal-actions">
+      ${q && canManageProject() ? '<button class="btn danger left" id="qam-del">削除</button>' : ''}
+      <button class="btn" data-close>キャンセル</button>
+      <button class="btn primary" id="qam-save">${q ? '保存' : '追加'}</button>
+    </div>`);
+  document.getElementById('qam-save').onclick = async () => {
+    const v = (id) => document.getElementById(id).value;
+    const title = v('qam-title').trim();
+    if (!title) { toast('件名を入力してください'); return; }
+    const body = {
+      title, category: v('qam-cat').trim(), asker_name: v('qam-asker').trim(),
+      asked_at: v('qam-asked') || null, due_date: v('qam-due') || null,
+      assignee_id: v('qam-assignee') ? Number(v('qam-assignee')) : null,
+      status: v('qam-status'), task_id: v('qam-task') ? Number(v('qam-task')) : null,
+      question: v('qam-question'), answer: v('qam-answer'),
+      decision: v('qam-decision'), note: v('qam-note'),
+      actor_id: State.currentUserId,
+    };
+    if (body.answer.trim() && body.status === 'open') body.status = 'answered';
+    try {
+      if (q) await API.qaUpdate(q.id, body);
+      else await API.qaCreate(State.pid, body);
+      closeModal();
+      render();
+    } catch (err) { toast(err.message); }
+  };
+  const del = document.getElementById('qam-del');
+  if (del) del.onclick = async () => {
+    if (!confirm(`${qaNo(q)}「${q.title}」を削除しますか？（やり取り履歴も削除されます）`)) return;
+    try {
+      await API.qaDelete(q.id, State.currentUserId);
+      closeModal();
+      render();
+    } catch (err) { toast(err.message); }
+  };
+  // やり取り履歴（既存QAのみ）
+  if (q) {
+    const box = document.getElementById('qam-thread');
+    const loadThread = async () => {
+      let items = [];
+      try { items = await API.qaComments(q.id); } catch (e) { box.textContent = e.message; return; }
+      box.innerHTML = items.map(c => `
+        <div class="qa-cline">
+          <div class="qa-cmeta">
+            ${c.author_id ? U.avatarHtml({ id: c.author_id, name: c.member_name || '?', color: c.member_color || '#7c8db5' }, 'sm') : ''}
+            <b>${U.esc(c.member_name || c.author_name || '-')}</b>
+            <span>${U.esc((c.created_at || '').slice(5, 16))}</span>
+            ${(c.author_id === State.currentUserId || canManageProject())
+              ? `<button class="icon-btn qa-cdel" data-cid="${c.id}" title="削除">✕</button>` : ''}
+          </div>
+          <div class="qa-cbody">${U.esc(c.body)}</div>
+        </div>`).join('') || '<div class="empty-note" style="padding:8px">やり取りはまだ記録されていません</div>';
+      box.querySelectorAll('.qa-cdel').forEach(b => b.onclick = async () => {
+        if (!confirm('この記録を削除しますか？')) return;
+        try { await API.qaCommentDel(Number(b.dataset.cid), State.currentUserId); loadThread(); }
+        catch (err) { toast(err.message); }
+      });
+      box.scrollTop = box.scrollHeight;
+    };
+    loadThread();
+    const post = async () => {
+      const ta = document.getElementById('qam-newcomment');
+      const text = ta.value.trim();
+      if (!text) return;
+      try {
+        await API.qaCommentAdd(q.id, { body: text, actor_id: State.currentUserId });
+        ta.value = '';
+        await loadThread();
+        q.comment_count = (q.comment_count || 0) + 1;
+      } catch (err) { toast(err.message); }
+    };
+    const pb = document.getElementById('qam-post');
+    if (pb) {
+      pb.onclick = post;
+      document.getElementById('qam-newcomment').onkeydown = (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) post();
+      };
+    }
+  }
+}
+
+/* =====================================================================
+ *  課題ビュー（課題→方針→実行内容を管理。タスクとは分離し関連タスクで紐づけ）
+ * =================================================================== */
+const ISSUE_STATUS = [['open', '未対応', '#e05252'], ['doing', '対応中', '#f59e0b'],
+                      ['resolved', '解決済み', '#16a34a'], ['closed', 'クローズ', '#64748b']];
+const issNo = (q) => `ISS-${String(q.seq).padStart(3, '0')}`;
+
+async function renderKadai(container) {
+  container.innerHTML = '<div class="empty-note">読み込み中…</div>';
+  let items = [];
+  try { items = await API.issuesList(State.pid); } catch (e) {
+    container.innerHTML = `<div class="empty-note">${U.esc(e.message)}</div>`;
+    return;
+  }
+  State.kadaiItems = items;
+  if (!State.kadaiFilter) State.kadaiFilter = { status: '', assignee: '', kw: '' };
+  drawKadaiView(container);
+}
+
+function drawKadaiView(container) {
+  const f = State.kadaiFilter;
+  const stMap = Object.fromEntries(ISSUE_STATUS.map(([k, l, c]) => [k, { l, c }]));
+  const items = State.kadaiItems.filter(q =>
+    (!f.status || (f.status === '_open' ? q.status !== 'closed' : q.status === f.status)) &&
+    (!f.assignee || q.assignee_id === Number(f.assignee)) &&
+    (!f.kw || `${q.title} ${q.description} ${q.policy} ${q.action_plan} ${q.category || ''} ${q.raised_by || ''}`
+      .toLowerCase().includes(f.kw.toLowerCase())));
+  const today = U.todayStr();
+  const openCnt = State.kadaiItems.filter(q => q.status !== 'closed').length;
+  const overdueCnt = State.kadaiItems.filter(q =>
+    q.due_date && ['open', 'doing'].includes(q.status) && q.due_date < today).length;
+  container.innerHTML = `
+  <div class="qa-toolbar">
+    ${canCreateTask() ? '<button class="btn primary sm" id="is-add">＋ 課題追加</button>' : ''}
+    <select id="is-fstatus"><option value="">状態: すべて</option>
+      <option value="_open" ${f.status === '_open' ? 'selected' : ''}>オープンのみ</option>
+      ${ISSUE_STATUS.map(([k, l]) => `<option value="${k}" ${f.status === k ? 'selected' : ''}>${l}</option>`).join('')}
+    </select>
+    <select id="is-fassignee"><option value="">担当: 全員</option>
+      ${State.members.map(m => `<option value="${m.id}" ${f.assignee === String(m.id) ? 'selected' : ''}>${U.esc(m.name)}</option>`).join('')}
+    </select>
+    <input type="search" id="is-kw" placeholder="🔍 キーワード" value="${U.esc(f.kw)}">
+    <span class="tag-chip">全 ${State.kadaiItems.length} 件 ／ オープン <b>${openCnt}</b> 件
+      ${overdueCnt ? `／ 期限超過 <b style="color:var(--danger)">${overdueCnt}</b> 件` : ''}</span>
+    <span class="spacer"></span>
+    <button class="btn sm" id="is-exp-x" title="整形済みの課題管理表Excelを出力">📗 Excel出力</button>
+    <button class="btn sm" id="is-exp-h" title="この一覧を単一HTMLで出力">📄 HTML出力</button>
+  </div>
+  <div class="qa-wrap"><table class="qa-table" style="min-width:1360px">
+    <thead><tr><th>No</th><th>重要度</th><th>件名・課題内容</th><th>起票者</th><th>起票日</th>
+      <th>担当</th><th>対応期限</th><th>状態</th><th>方針</th><th>実行内容</th><th>解決日</th></tr></thead>
+    <tbody>${items.map(q => {
+      const overdue = q.due_date && ['open', 'doing'].includes(q.status) && q.due_date < today;
+      const st = stMap[q.status] || { l: q.status, c: '#8b95a7' };
+      return `<tr data-iid="${q.id}">
+        <td class="qa-no">${issNo(q)}</td>
+        <td>${U.prioHtml(q.priority)}</td>
+        <td class="qa-q"><b>${U.esc(q.title)}</b>
+          ${q.comment_count ? ` <span class="tag-chip" title="コメント ${q.comment_count} 件">💬${q.comment_count}</span>` : ''}
+          ${q.category ? ` <span class="tag-chip">${U.esc(q.category)}</span>` : ''}
+          ${q.description ? `<div class="qa-detail">${U.esc(q.description)}</div>` : ''}
+          ${(q.tasks || []).length ? `<div class="qa-detail">🔗 ${q.tasks.map(t =>
+            U.esc((wbsOf(t.id) ? wbsOf(t.id) + ' ' : '') + t.title)).join(' ／ ')}</div>` : ''}</td>
+        <td>${U.esc(q.raised_by || '—')}</td>
+        <td class="qa-date">${U.esc((q.raised_at || '').slice(5))}</td>
+        <td>${U.esc(q.assignee_name || '—')}</td>
+        <td class="qa-date ${overdue ? 'qa-overdue' : ''}">${U.esc((q.due_date || '').slice(5))}${overdue ? ' ⚠' : ''}</td>
+        <td><span class="badge" style="background:${st.c}">${st.l}</span></td>
+        <td class="qa-a">${U.esc(q.policy || '')}</td>
+        <td class="qa-a">${U.esc(q.action_plan || '')}</td>
+        <td class="qa-date">${U.esc((q.resolved_at || '').slice(5))}</td></tr>`;
+    }).join('') || `<tr><td colspan="11"><div class="empty-note">課題はまだありません${canCreateTask() ? '。「＋課題追加」から登録できます' : ''}</div></td></tr>`}
+    </tbody></table></div>`;
+
+  const fs = container.querySelector('#is-fstatus');
+  fs.onchange = () => { f.status = fs.value; drawKadaiView(container); };
+  const fa = container.querySelector('#is-fassignee');
+  fa.onchange = () => { f.assignee = fa.value; drawKadaiView(container); };
+  const kw = container.querySelector('#is-kw');
+  kw.oninput = U.debounce(() => {
+    f.kw = kw.value;
+    drawKadaiView(container);
+    const el = container.querySelector('#is-kw');
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, 300);
+  const add = container.querySelector('#is-add');
+  if (add) add.onclick = () => openKadaiModal();
+  container.querySelectorAll('tr[data-iid]').forEach(tr => {
+    tr.onclick = () => openKadaiModal(State.kadaiItems.find(x => x.id === Number(tr.dataset.iid)));
+  });
+  container.querySelector('#is-exp-x').onclick = () => exportViewXlsx('kadai');
+  container.querySelector('#is-exp-h').onclick = () => exportViewHtml('kadai');
+}
+
+function openKadaiModal(q = null) {
+  showModal(`
+    <h2>${q ? `${issNo(q)} の編集` : '＋ 課題を追加'}</h2>
+    <div class="form-row"><label>件名 *</label><input id="ism-title" value="${U.esc(q ? q.title : '')}" autofocus></div>
+    <div class="form-cols">
+      <div class="form-row"><label>重要度</label>
+        <select id="ism-priority">${['highest', 'high', 'medium', 'low'].map(p =>
+          `<option value="${p}" ${(q ? q.priority : 'medium') === p ? 'selected' : ''}>${U.prioLabel[p]}</option>`).join('')}</select></div>
+      <div class="form-row"><label>分類</label><input id="ism-cat" value="${U.esc(q ? q.category || '' : '')}" placeholder="仕様 / 体制 / 技術 など"></div>
+      <div class="form-row"><label>起票者</label><input id="ism-raised" value="${U.esc(q ? q.raised_by || '' : (State.loginUser ? State.loginUser.name : ''))}"></div>
+      <div class="form-row"><label>起票日</label><input type="date" id="ism-raisedat" value="${U.esc(q ? q.raised_at || '' : U.todayStr())}"></div>
+      <div class="form-row"><label>担当者</label>
+        <select id="ism-assignee"><option value="">未定</option>
+          ${State.members.map(m => `<option value="${m.id}" ${q && q.assignee_id === m.id ? 'selected' : ''}>${U.esc(m.name)}</option>`).join('')}
+        </select></div>
+      <div class="form-row"><label>対応期限</label><input type="date" id="ism-due" value="${U.esc(q ? q.due_date || '' : '')}"></div>
+      <div class="form-row"><label>状態</label>
+        <select id="ism-status">${ISSUE_STATUS.map(([k, l]) =>
+          `<option value="${k}" ${(q ? q.status : 'open') === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <div class="form-row"><label>解決日</label><input type="date" id="ism-resolved" value="${U.esc(q ? q.resolved_at || '' : '')}" placeholder="解決/クローズ時に自動設定"></div>
+    </div>
+    <div class="form-row"><label>課題の内容・背景</label><textarea id="ism-desc" rows="3">${U.esc(q ? q.description || '' : '')}</textarea></div>
+    <div class="form-row"><label>方針</label><textarea id="ism-policy" rows="3" placeholder="どう対処するかの方針">${U.esc(q ? q.policy || '' : '')}</textarea></div>
+    <div class="form-row"><label>実行内容</label><textarea id="ism-action" rows="3" placeholder="実際に行う（行った）対応内容">${U.esc(q ? q.action_plan || '' : '')}</textarea></div>
+    <div class="form-row"><label>関連タスク（Ctrl+クリックで複数選択。ボード・テーブルのタスクに 📌件数 が表示されます）</label>
+      <select id="ism-tasks" multiple size="5">
+        ${buildWbs(State.tasks).map(t => `<option value="${t.id}"
+          ${q && (q.tasks || []).some(x => x.id === t.id) ? 'selected' : ''}>${U.esc(taskLabel(t))}</option>`).join('')}
+      </select></div>
+    ${q ? `<div class="form-row"><label>コメント（経緯・対応記録を時系列で）</label>
+      <div id="ism-thread" class="qa-thread"><div class="empty-note" style="padding:8px">読み込み中…</div></div>
+      ${canCreateTask() ? `<div style="display:flex;gap:8px;margin-top:6px">
+        <textarea id="ism-newcomment" rows="2" placeholder="対応状況・決定事項など（Ctrl+Enterで記録）" style="flex:1"></textarea>
+        <button class="btn sm primary" id="ism-post" style="align-self:flex-end">記録</button>
+      </div>` : ''}</div>` : ''}
+    <div class="modal-actions">
+      ${q && canManageProject() ? '<button class="btn danger left" id="ism-del">削除</button>' : ''}
+      <button class="btn" data-close>キャンセル</button>
+      <button class="btn primary" id="ism-save">${q ? '保存' : '追加'}</button>
+    </div>`);
+  document.getElementById('ism-save').onclick = async () => {
+    const v = (id) => document.getElementById(id).value;
+    const title = v('ism-title').trim();
+    if (!title) { toast('件名を入力してください'); return; }
+    const body = {
+      title, priority: v('ism-priority'), category: v('ism-cat').trim(),
+      raised_by: v('ism-raised').trim(), raised_at: v('ism-raisedat') || null,
+      assignee_id: v('ism-assignee') ? Number(v('ism-assignee')) : null,
+      due_date: v('ism-due') || null, status: v('ism-status'),
+      resolved_at: v('ism-resolved') || null,
+      description: v('ism-desc'), policy: v('ism-policy'), action_plan: v('ism-action'),
+      task_ids: [...document.getElementById('ism-tasks').selectedOptions].map(o => Number(o.value)),
+      actor_id: State.currentUserId,
+    };
+    try {
+      if (q) await API.issueUpdate(q.id, body);
+      else await API.issueCreate(State.pid, body);
+      closeModal();
+      await loadProject(State.pid);   // タスクの📌件数を更新
+      render();
+    } catch (err) { toast(err.message); }
+  };
+  const del = document.getElementById('ism-del');
+  if (del) del.onclick = async () => {
+    if (!confirm(`${issNo(q)}「${q.title}」を削除しますか？（コメント・関連付けも削除されます）`)) return;
+    try {
+      await API.issueDelete(q.id, State.currentUserId);
+      closeModal();
+      await loadProject(State.pid);
+      render();
+    } catch (err) { toast(err.message); }
+  };
+  // コメントスレッド（既存課題のみ）
+  if (q) {
+    const box = document.getElementById('ism-thread');
+    const loadThread = async () => {
+      let items = [];
+      try { items = await API.issueComments(q.id); } catch (e) { box.textContent = e.message; return; }
+      box.innerHTML = items.map(c => `
+        <div class="qa-cline">
+          <div class="qa-cmeta">
+            ${c.author_id ? U.avatarHtml({ id: c.author_id, name: c.member_name || '?', color: c.member_color || '#7c8db5' }, 'sm') : ''}
+            <b>${U.esc(c.member_name || c.author_name || '-')}</b>
+            <span>${U.esc((c.created_at || '').slice(5, 16))}</span>
+            ${(c.author_id === State.currentUserId || canManageProject())
+              ? `<button class="icon-btn qa-cdel" data-cid="${c.id}" title="削除">✕</button>` : ''}
+          </div>
+          <div class="qa-cbody">${U.esc(c.body)}</div>
+        </div>`).join('') || '<div class="empty-note" style="padding:8px">コメントはまだありません</div>';
+      box.querySelectorAll('.qa-cdel').forEach(b => b.onclick = async () => {
+        if (!confirm('このコメントを削除しますか？')) return;
+        try { await API.issueCommentDel(Number(b.dataset.cid), State.currentUserId); loadThread(); }
+        catch (err) { toast(err.message); }
+      });
+      box.scrollTop = box.scrollHeight;
+    };
+    loadThread();
+    const post = async () => {
+      const ta = document.getElementById('ism-newcomment');
+      const text = ta.value.trim();
+      if (!text) return;
+      try {
+        await API.issueCommentAdd(q.id, { body: text, actor_id: State.currentUserId });
+        ta.value = '';
+        await loadThread();
+        q.comment_count = (q.comment_count || 0) + 1;
+      } catch (err) { toast(err.message); }
+    };
+    const pb = document.getElementById('ism-post');
+    if (pb) {
+      pb.onclick = post;
+      document.getElementById('ism-newcomment').onkeydown = (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) post();
+      };
+    }
+  }
+}
+
+/* タスク詳細などから課題を開く（課題ビューに切り替えてモーダル表示） */
+async function openIssueById(iid) {
+  try {
+    const items = await API.issuesList(State.pid);
+    State.kadaiItems = items;
+    const it = items.find(x => x.id === iid);
+    if (!it) { toast('課題が見つかりません'); return; }
+    State.view = 'kadai';
+    render();
+    openKadaiModal(it);
+  } catch (err) { toast(err.message); }
+}
+
+/* =====================================================================
+ *  管理画面（マネージャー／サイト管理者のみ）
+ *  プロジェクト管理・横断分析・組織/ユーザー管理を集約
+ * =================================================================== */
+function renderManagePage(container) {
+  if (loginRank() < 3) {
+    container.innerHTML = '<div class="empty-note">管理画面はマネージャー／サイト管理者のみ利用できます。</div>';
+    return;
+  }
+  const tab = State.manageTab || 'projects';
+  container.innerHTML = `
+    <div class="manage-tabs">
+      ${[['projects', '📁 プロジェクト管理'], ['analytics', '📊 横断分析'],
+         ['org', '🏢 組織・ユーザー']].map(([k, l]) =>
+        `<button class="btn sm ${tab === k ? 'primary' : ''}" data-mtab="${k}">${l}</button>`).join('')}
+    </div>
+    <div id="manage-body"><div class="empty-note">読み込み中…</div></div>`;
+  container.querySelectorAll('[data-mtab]').forEach(b => {
+    b.onclick = () => { State.manageTab = b.dataset.mtab; render(); };
+  });
+  const body = container.querySelector('#manage-body');
+  if (tab === 'org') renderAdminPage(body);
+  else if (tab === 'analytics') renderManageAnalytics(body);
+  else renderManageProjects(body);
+}
+
+/* ---- 管理画面: プロジェクト管理タブ ---- */
+async function renderManageProjects(body) {
+  let list;
+  try { list = await API.adminProjects(); } catch (e) {
+    body.innerHTML = `<div class="empty-note">${U.esc(e.message)}</div>`;
+    return;
+  }
+  const openProj = async (pid, view) => {
+    await loadBootstrap();
+    await loadProject(pid);
+    State.view = view;
+    render();
+  };
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;margin-bottom:10px">
+      <span class="set-hint" style="margin:0">メンバーのアサイン（外部ユーザー含む）は各プロジェクトの「👥 メンバー」から行います。</span>
+      <span class="spacer"></span>
+      <button class="btn primary sm" id="mp-new">＋ 新規プロジェクト</button>
+    </div>
+    <div class="mp-grid">${list.map(x => {
+      const p = x.project;
+      const exts = x.members.filter(m => m.account_type === 'external');
+      const ints = x.members.filter(m => m.account_type !== 'external');
+      const delay = (x.elapsed_pct != null && x.elapsed_pct - x.progress_avg >= 20);
+      const badges = [
+        p.status === 'archived' ? '<span class="tag-chip">📦 アーカイブ</span>' : '',
+        x.overdue ? `<span class="mp-badge red">⚠ 超過 ${x.overdue}</span>` : '',
+        x.qa_open ? `<span class="mp-badge amber">❓ QA待ち ${x.qa_open}</span>` : '',
+        delay ? '<span class="mp-badge red">🐢 進捗遅れ</span>' : '',
+        x.stalled ? '<span class="mp-badge gray">💤 停滞(7日更新なし)</span>' : '',
+      ].filter(Boolean).join('');
+      return `
+      <div class="dash-card mp-card" data-pid="${p.id}">
+        <div class="mp-head">
+          <span class="proj-dot" style="background:${U.esc(p.color)}"></span>
+          <b class="mp-name">${U.esc(p.name)}</b>${badges}
+        </div>
+        <div class="mp-meta">${U.esc(p.start_date || '—')} 〜 ${U.esc(p.end_date || '—')}
+          ／ タスク ${x.done}/${x.total} ／ 最終更新 ${U.esc((x.last_activity || '—').slice(0, 10))}</div>
+        <div class="mp-progress"><div style="width:${x.progress_avg}%"></div>
+          ${x.elapsed_pct != null ? `<span class="mp-elapsed" style="left:${x.elapsed_pct}%" title="期間経過 ${x.elapsed_pct}%"></span>` : ''}</div>
+        <div class="mp-meta">進捗 ${x.progress_avg}%${x.elapsed_pct != null ? ` ／ 期間経過 ${x.elapsed_pct}%` : ''}</div>
+        <div class="mp-members">
+          ${ints.slice(0, 8).map(m => U.avatarHtml(m, 'sm')).join('')}
+          ${ints.length > 8 ? `<span class="mp-meta">+${ints.length - 8}</span>` : ''}
+          ${exts.length ? `<span class="ext-chip" title="${U.esc(exts.map(m2 => m2.name).join('・'))}">外部 ${exts.length}名</span>
+            <span class="mp-meta">公開: ${U.esc((x.external_tabs || []).map(t => TAB_LABELS_JS[t] || t).join('・') || 'なし')}</span>` : ''}
+        </div>
+        <div class="mp-actions">
+          <button class="btn sm" data-open-pj="${p.id}">開く</button>
+          <button class="btn sm" data-members-pj="${p.id}">👥 メンバー</button>
+          <button class="btn sm" data-settings-pj="${p.id}">⚙ 設定</button>
+        </div>
+      </div>`;
+    }).join('')}</div>`;
+  body.querySelector('#mp-new').onclick = openProjectModal;
+  body.querySelectorAll('[data-open-pj]').forEach(b =>
+    b.onclick = () => openProj(Number(b.dataset.openPj), 'dashboard'));
+  body.querySelectorAll('[data-settings-pj]').forEach(b =>
+    b.onclick = () => openProj(Number(b.dataset.settingsPj), 'settings'));
+  body.querySelectorAll('[data-members-pj]').forEach(b =>
+    b.onclick = async () => {
+      await loadBootstrap();
+      await loadProject(Number(b.dataset.membersPj));
+      render();
+      openAssignModal({ externalSection: true });   // 管理画面からのみ外部セクションつき
+    });
+}
+
+/* ---- 管理画面: 横断分析タブ ---- */
+async function renderManageAnalytics(body) {
+  let a;
+  try { a = await API.adminAnalytics(); } catch (e) {
+    body.innerHTML = `<div class="empty-note">${U.esc(e.message)}</div>`;
+    return;
+  }
+  const wl = a.workload.filter(w => w.open || w.done_30d);
+  const busiest = a.workload.filter(w => w.open).slice(0, 12);
+  body.innerHTML = `
+  <div class="dash" style="display:grid;grid-template-columns:repeat(12,1fr);gap:14px">
+    <div class="dash-card span7"><h3>👥 メンバー負荷（稼働中PJ・実作業タスクのみ）</h3>
+      <table class="task-table" style="min-width:0">
+        <thead><tr><th>メンバー</th><th>担当中</th><th>超過</th><th>今週期限</th>
+          <th>残見積h</th><th>関与PJ</th><th>30日完了</th></tr></thead>
+        <tbody>${wl.map(w => `
+          <tr>
+            <td><span class="a-dot" style="background:${U.esc(w.color)}"></span>${U.esc(w.name)}
+              ${w.account_type === 'external' ? '<span class="ext-chip">外部</span>' : ''}</td>
+            <td>${w.open}</td>
+            <td class="${w.overdue ? 'qa-overdue' : ''}">${w.overdue || ''}</td>
+            <td>${w.due_week || ''}</td>
+            <td>${w.est_open || ''}</td>
+            <td>${w.projects || ''}</td>
+            <td style="color:#16a34a">${w.done_30d || ''}</td>
+          </tr>`).join('') || '<tr><td colspan="7">データなし</td></tr>'}</tbody>
+      </table></div>
+    <div class="dash-card span5"><h3>📊 担当中タスク数（多い順）</h3>
+      ${Charts.hbar(busiest.map(w => ({ label: w.name.split(/[\s　]/)[0], color: w.color, value: w.open })),
+                    { width: 320 })}</div>
+    <div class="dash-card span6"><h3>📈 週次スループット（完了タスク数・直近8週）</h3>
+      ${Charts.line(a.weekly_done.map(w => w.done),
+                    { width: 520, height: 150, labels: a.weekly_done.map(w => w.label) })}</div>
+    <div class="dash-card span6"><h3>🚨 期限超過ワースト（全PJ横断）</h3>
+      <ul class="deadline-list">${a.overdue_tasks.map(t => `
+        <li data-ot-pid="${t.project_id}" data-ot-tid="${t.id}">
+          <span class="tag-chip">${U.esc(t.project_name)}</span>
+          <span class="t">${U.esc(t.title)}</span>
+          <span style="color:var(--muted);font-size:12px">${U.esc(t.assignee || '未割当')}</span>
+          <span class="due overdue">${t.days}日超過</span></li>`).join('') ||
+        '<div class="empty-note">期限超過はありません 🎉</div>'}</ul></div>
+    <div class="dash-card span12"><h3>🔒 外部ユーザーのアクセス状況（セキュリティレビュー）</h3>
+      ${a.externals.map(e => `
+        <div class="status-edit-row" style="align-items:flex-start">
+          <span style="min-width:180px"><b>${U.esc(e.name)}</b><br>
+            <span style="color:var(--muted);font-size:11.5px">${U.esc(e.email || '')}<br>
+            最終ログイン: ${U.esc((e.last_login || 'なし').slice(0, 16))}</span></span>
+          <div style="flex:1">${e.projects.map(pj => `
+            <div style="font-size:12.5px;margin-bottom:3px">
+              <span class="tag-chip">${U.esc(pj.name)}</span>
+              公開タブ: <b>${U.esc((pj.tabs || []).map(t => TAB_LABELS_JS[t] || t).join('・') || 'なし')}</b>
+              ／ 💬コメント ${pj.can_view_comments ? '<b style="color:#d97706">可</b>' : '不可'}
+              ／ 📄詳細 ${pj.can_view_detail ? '<b style="color:#d97706">可</b>' : '不可'}
+            </div>`).join('') || '<span style="color:var(--muted);font-size:12px">アサインなし（どのPJにもアクセス不可）</span>'}
+          </div>
+        </div>`).join('') || '<div class="empty-note">外部ユーザーはいません</div>'}
+    </div>
+  </div>`;
+  body.querySelectorAll('[data-ot-pid]').forEach(li => li.onclick = async () => {
+    await loadProject(Number(li.dataset.otPid));
+    State.view = 'table';
+    render();
+    openDetail(Number(li.dataset.otTid));
+  });
+}
+
+/* =====================================================================
+ *  ユーザー設定（左下の⚙。ユーザーごとの表示・通知設定＝user_prefs保存）
+ * =================================================================== */
+function renderMySettings(container) {
+  const p = State.prefs || {};
+  const nw = p.notify_webhook || {};
+  const NTYPES = [['mention', '💬 メンション'], ['assign', '📌 担当割当'],
+    ['comment', '🗨 コメント'], ['status', '🔄 ステータス変更'],
+    ['due', '⏰ 期限リマインド'], ['watch', '👁 ウォッチ中の変更'], ['system', 'ℹ システム']];
+  const evOn = (t) => !nw.events || nw.events.includes(t);
+  container.innerHTML = `
+  <div class="usettings">
+    <p class="set-hint" style="margin:0">この設定は<b>あなたの画面・あなた宛ての通知にのみ</b>反映されます（user単位で保存）。</p>
+
+    <div class="dash-card">
+      <h3>🎨 表示</h3>
+      <div class="set-row"><label style="flex:1">テーマ
+          <small>画面の配色。「OSに合わせる」はWindows/ブラウザのダークモード設定に追従します</small></label>
+        <select id="us-theme">
+          <option value="light" ${(p.theme || 'light') === 'light' ? 'selected' : ''}>☀ ライト</option>
+          <option value="dark" ${p.theme === 'dark' ? 'selected' : ''}>🌙 ダーク</option>
+          <option value="system" ${p.theme === 'system' ? 'selected' : ''}>💻 OSに合わせる</option>
+        </select></div>
+      <div class="set-row"><label style="flex:1">表示密度
+          <small>「コンパクト」は文字・余白を詰めて一覧性を上げます（テーブル・ボード向け）</small></label>
+        <select id="us-density">
+          <option value="normal" ${(p.density || 'normal') === 'normal' ? 'selected' : ''}>標準</option>
+          <option value="compact" ${p.density === 'compact' ? 'selected' : ''}>コンパクト</option>
+        </select></div>
+      <div class="set-row"><label style="flex:1">ログイン後の初期表示
+          <small>アプリを開いたときに最初に表示する画面</small></label>
+        <select id="us-start">
+          <option value="home" ${(p.start_view || 'home') === 'home' ? 'selected' : ''}>🏠 ホーム（マイダッシュボード）</option>
+          <option value="last" ${p.start_view === 'last' ? 'selected' : ''}>↩ 前回開いていた画面</option>
+        </select></div>
+      <p class="set-hint">担当者の表示色は「組織・ユーザー管理」、ダッシュボードの配置はダッシュボードの「⚙編集」で変更できます。</p>
+    </div>
+
+    <div class="dash-card">
+      <h3>🔔 通知</h3>
+      <div class="set-row"><label style="flex:1">デスクトップ通知
+          <small>ブラウザの通知機能で、自分宛ての新着通知をポップアップ表示します（このブラウザのみ）</small></label>
+        <label class="chk"><input type="checkbox" id="us-desktop" ${p.desktop_notify ? 'checked' : ''}> 有効</label></div>
+
+      <div class="set-row" style="display:block">
+        <label class="chk" style="font-size:14px;color:var(--text)">
+          <input type="checkbox" id="us-wh-on" ${nw.enabled ? 'checked' : ''}>
+          <b>外部チャットへ転送する</b>（Slack / Google Chat / Teams / Discord）</label>
+        <small style="color:var(--muted);display:block;margin:4px 0 8px 22px">
+          自分宛ての通知を、DM・個人チャネル用に発行した <b>Incoming Webhook URL</b> へ送ります。
+          Slack: App「Incoming Webhooks」／ Google Chat: スペース →「アプリと統合」→ Webhook ／
+          Teams: Workflows「Webhook要求の受信時」／ Discord: チャンネル設定 → 連携サービス → ウェブフック。
+          送信形式はURLから自動判定されます（手動指定も可）。</small>
+        <div style="display:flex;gap:8px;margin-left:22px;flex-wrap:wrap">
+          <select id="us-wh-provider" title="送信先サービス（ペイロード形式）">
+            ${[['auto', '🔍 自動判定'], ['slack', 'Slack'], ['googlechat', 'Google Chat'],
+               ['teams', 'Microsoft Teams'], ['discord', 'Discord'], ['text', 'その他（{"text"} 汎用）']]
+              .map(([v, l]) => `<option value="${v}" ${(nw.provider || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+          <input id="us-wh-url" placeholder="https://…（Incoming Webhook URL）" value="${U.esc(nw.url || '')}"
+            style="flex:1;min-width:260px;border:1px solid var(--line);border-radius:8px;padding:7px 10px">
+          <button class="btn sm" id="us-wh-test">テスト送信</button>
+        </div>
+        <div style="margin:8px 0 0 22px;display:flex;gap:12px;flex-wrap:wrap" id="us-wh-events">
+          ${NTYPES.map(([t, l]) => `<label class="chk"><input type="checkbox" data-ev="${t}" ${evOn(t) ? 'checked' : ''}> ${l}</label>`).join('')}
+        </div>
+      </div>
+    </div>
+
+    <div class="dash-card">
+      <h3>🔑 アカウント</h3>
+      <div class="set-row"><label style="flex:1">メールアドレス（ログインID）
+          <small>${U.esc((State.loginUser || {}).email || '未設定')} — 変更はサイト管理者に依頼してください</small></label></div>
+      <div class="set-row"><label style="flex:1">パスワード / APIトークン
+          <small>パスワード変更と、自動化・AI連携用のAPIトークンの発行・失効</small></label>
+        <button class="btn sm" id="us-password">🔑 開く</button></div>
+    </div>
+  </div>`;
+
+  const setP = async (key, value) => {
+    State.prefs[key] = value;
+    try { await API.setPref(State.currentUserId, key, value); }
+    catch (e) { toast(e.message); }
+  };
+  document.getElementById('us-theme').onchange = async (e) => {
+    await setP('theme', e.target.value);
+    applyUserPrefs();
+  };
+  document.getElementById('us-density').onchange = async (e) => {
+    await setP('density', e.target.value);
+    applyUserPrefs();
+  };
+  document.getElementById('us-start').onchange = (e) => setP('start_view', e.target.value);
+  document.getElementById('us-desktop').onchange = async (e) => {
+    if (e.target.checked) {
+      if (!('Notification' in window)) { toast('このブラウザはデスクトップ通知に対応していません'); e.target.checked = false; return; }
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') { toast('ブラウザの通知が許可されませんでした'); e.target.checked = false; return; }
+    }
+    await setP('desktop_notify', e.target.checked);
+    if (e.target.checked) toast('デスクトップ通知を有効にしました');
+  };
+  // 外部転送: まとめて notify_webhook に保存
+  const saveWebhook = () => {
+    const events = [...document.querySelectorAll('#us-wh-events [data-ev]')]
+      .filter(c => c.checked).map(c => c.dataset.ev);
+    return setP('notify_webhook', {
+      enabled: document.getElementById('us-wh-on').checked,
+      url: document.getElementById('us-wh-url').value.trim(),
+      provider: document.getElementById('us-wh-provider').value,
+      events,
+    });
+  };
+  document.getElementById('us-wh-on').onchange = saveWebhook;
+  document.getElementById('us-wh-url').onchange = saveWebhook;
+  document.getElementById('us-wh-provider').onchange = saveWebhook;
+  document.querySelectorAll('#us-wh-events [data-ev]').forEach(c => c.onchange = saveWebhook);
+  document.getElementById('us-wh-test').onclick = async () => {
+    const url = document.getElementById('us-wh-url').value.trim();
+    if (!url) { toast('Webhook URL を入力してください'); return; }
+    const btn = document.getElementById('us-wh-test');
+    btn.disabled = true;
+    try {
+      const r = await API.webhookTest(url, document.getElementById('us-wh-provider').value);
+      await saveWebhook();
+      const names = { slack: 'Slack', googlechat: 'Google Chat', teams: 'Teams', discord: 'Discord', text: '汎用形式' };
+      toast(`✅ ${names[r.provider] || r.provider} 形式でテスト送信しました。チャット側で受信を確認してください`);
+    } catch (err) { toast(err.message); }
+    btn.disabled = false;
+  };
+  document.getElementById('us-password').onclick = openPasswordModal;
+}
+
+/* =====================================================================
  *  ノートビュー（PJのルール・環境・体制などの共有メモ）
  * =================================================================== */
 function noteContentHtml(content) {
@@ -2067,8 +2953,18 @@ function renderSettingsPage(container) {
       <button class="btn sm" id="set-add-va">＋ 選択肢を追加</button>
     </div>
 
-    <div class="dash-card span6"><h3>外部ユーザーの既定・制限</h3>
-      <p class="set-hint">新しく外部ユーザーをアサインしたときの初期値。個別の変更はメンバー管理から。</p>
+    <div class="dash-card span6 ext-danger-box"><h3>🔒 外部パートナーの公開範囲・制限</h3>
+      <p class="set-hint">外部（社外）アカウントに関する設定。<b>変更の保存にはマネージャー／サイト管理者の権限と、
+        プロジェクト名の確認入力が必要です</b>（サーバー側でも二重に検証されます）。</p>
+      <div class="form-row"><label>公開するタブ（チェックしたタブだけが外部ユーザーに表示され、API側でも遮断されます）</label>
+        ${[['dashboard', '📊 ダッシュボード'], ['board', '📋 ボード'], ['table', '📑 テーブル'],
+           ['gantt', '📅 WBSガント'], ['calendar', '📆 カレンダー'], ['qa', '❓ QA'],
+           ['kadai', '📌 課題（既定で非公開）'],
+           ['issues', '💬 コメント一覧'], ['notes', '📖 ノート']].map(([k, l]) => `
+          <label class="chk" style="display:inline-flex;margin:2px 14px 2px 0">
+            <input type="checkbox" data-exttab="${k}" ${(s.external_visible_tabs || []).includes(k) ? 'checked' : ''}
+              ${loginRank() < 3 ? 'disabled title="変更はマネージャー／サイト管理者のみ"' : ''}>${l}</label>`).join('')}
+      </div>
       ${chk('external_default_view_comments', '外部にコメント閲覧を既定で許可')}
       ${chk('external_default_view_detail', '外部にタスク詳細閲覧を既定で許可')}
       ${chk('external_can_export', '外部のエクスポートを許可')}
@@ -2084,7 +2980,7 @@ function renderSettingsPage(container) {
     <div class="dash-card span6"><h3>🔔 通知（Teams / Slack Webhook）</h3>
       <p class="set-hint">Incoming Webhook の URL を設定すると、選択したイベントをチャネルへ送信します。</p>
       <div class="form-row"><label>Webhook URL</label>
-        <input id="set-webhook" value="${U.esc(s.webhook_url || '')}" placeholder="https://outlook.office.com/webhook/… または https://hooks.slack.com/…"></div>
+        <input id="set-webhook" value="${U.esc(s.webhook_url || '')}" placeholder="Slack / Google Chat / Teams / Discord の Incoming Webhook URL（形式は自動判定）"></div>
       <div class="form-row"><label>送信するイベント</label>
         ${[['mention', '@メンション'], ['assign', '担当割当'], ['due', '期限リマインド'],
            ['status', 'ステータス変更'], ['comment', 'コメント']].map(([k, l]) => `
@@ -2172,6 +3068,8 @@ function renderSettingsPage(container) {
     out.webhook_url = container.querySelector('#set-webhook').value.trim();
     out.webhook_events = [...container.querySelectorAll('[data-wevent]')]
       .filter(cb => cb.checked).map(cb => cb.dataset.wevent);
+    out.external_visible_tabs = [...container.querySelectorAll('[data-exttab]')]
+      .filter(cb => cb.checked).map(cb => cb.dataset.exttab);
     out.note_templates = [...container.querySelectorAll('[data-tpl]')].map(row => ({
       category: row.querySelector('[data-f=category]').value.trim() || 'その他',
       title: row.querySelector('[data-f=title]').value.trim(),
@@ -2179,7 +3077,7 @@ function renderSettingsPage(container) {
     return out;
   };
 
-  const saveSettings = async () => {
+  const saveSettings = async (confirmText) => {
     // ステータス変更を保存
     for (const row of container.querySelectorAll('#ps-statuses .status-edit-row')) {
       const sid = Number(row.dataset.sid);
@@ -2206,12 +3104,56 @@ function renderSettingsPage(container) {
       color: swatchValue('set-colors'),
       custom_fields: cfs,
       settings: collectSettings(),
+      ...(confirmText ? { confirm_text: confirmText } : {}),
     }, State.currentUserId);
     await loadBootstrap();
     await loadProject(p.id);
   };
 
+  // 外部公開設定の変更検知 → 確認モーダル（プロジェクト名の入力必須）
+  const EXT_KEYS = [['external_visible_tabs', '公開タブ'],
+                    ['external_can_export', 'エクスポート許可'],
+                    ['external_default_view_comments', 'コメント閲覧の既定'],
+                    ['external_default_view_detail', '詳細閲覧の既定']];
+  const extChanges = () => {
+    const ns = collectSettings();
+    return EXT_KEYS.filter(([k]) =>
+      JSON.stringify(s[k] ?? null) !== JSON.stringify(ns[k] ?? null))
+      .map(([k, label]) => ({ k, label, value: ns[k] }));
+  };
+  const openExtConfirm = (changes) => {
+    showModal(`
+      <h2>🔒 外部公開設定の変更確認</h2>
+      <div class="ext-warn">外部パートナーに公開される情報の範囲が変わります。内容をよく確認してください。</div>
+      <ul style="font-size:13px;line-height:1.9;margin:10px 0">
+        ${changes.map(c => `<li><b>${c.label}</b> → ${
+          c.k === 'external_visible_tabs'
+            ? (c.value.map(t => TAB_LABELS_JS[t] || t).join('・') || '<b style="color:#dc2626">すべて非公開</b>')
+            : (c.value ? '<b style="color:#d97706">許可する</b>' : '許可しない')}</li>`).join('')}
+      </ul>
+      <div class="form-row"><label>確認のため、プロジェクト名「${U.esc(p.name)}」を入力してください</label>
+        <input id="exc-name" autocomplete="off"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>キャンセル</button>
+        <button class="btn danger" id="exc-ok" disabled>変更を保存</button>
+      </div>`);
+    const inp = document.getElementById('exc-name');
+    const ok = document.getElementById('exc-ok');
+    inp.oninput = () => { ok.disabled = inp.value.trim() !== p.name; };
+    inp.focus();
+    ok.onclick = async () => {
+      try {
+        await saveSettings(inp.value.trim());
+        closeModal();
+        toast('プロジェクト設定を保存しました（外部公開設定の変更を記録）');
+        render();
+      } catch (err) { toast('保存に失敗: ' + err.message); }
+    };
+  };
+
   container.querySelector('#set-save').onclick = async () => {
+    const changes = extChanges();
+    if (changes.length) { openExtConfirm(changes); return; }
     try {
       await saveSettings();
       toast('プロジェクト設定を保存しました');

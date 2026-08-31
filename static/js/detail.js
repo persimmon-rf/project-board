@@ -161,6 +161,17 @@ function renderDetailPanel(d) {
         </ul>
       </div>
 
+      ${(d.issues || []).length ? `<div class="dp-section">
+        <h3>📌 関連する課題（オープン ${(d.issues || []).filter(x => x.status !== 'closed').length} 件）</h3>
+        <div>${d.issues.map(x => {
+          const st = { open: ['未対応', '#e05252'], doing: ['対応中', '#f59e0b'],
+                       resolved: ['解決済み', '#16a34a'], closed: ['クローズ', '#64748b'] }[x.status] || [x.status, '#8b95a7'];
+          return `<div class="status-edit-row" style="cursor:pointer" data-open-issue="${x.id}">
+            <span class="badge" style="background:${st[1]}">${st[0]}</span>
+            <span style="flex:1">ISS-${String(x.seq).padStart(3, '0')} ${U.esc(x.title)}</span></div>`;
+        }).join('')}</div>
+      </div>` : ''}
+
       <div class="dp-section">
         <h3>関連リンク（${d.links.length}）
           ${canEditTask(t) ? '<button class="btn sm ghost" id="dp-add-link">＋追加</button>' : ''}</h3>
@@ -333,6 +344,12 @@ function bindDetailEvents(t, d) {
   });
   document.querySelectorAll('#detail-panel [data-open-task]').forEach(a => {
     a.onclick = (e) => { e.preventDefault(); openDetail(Number(a.dataset.openTask)); };
+  });
+  document.querySelectorAll('#detail-panel [data-open-issue]').forEach(el => {
+    el.onclick = () => {
+      closeDetail();
+      openIssueById(Number(el.dataset.openIssue));
+    };
   });
   document.querySelectorAll('#detail-panel [data-edit-comment]').forEach(btn => {
     btn.onclick = async () => {
