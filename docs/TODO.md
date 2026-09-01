@@ -88,6 +88,7 @@
 - [x] ユーザー設定ページ（左下⚙→view='mysettings'・#/mysettings。user_prefs保存）: ①テーマ（ライト/ダーク/OS追従。body.theme-dark＋CSS変数上書き）②表示密度（標準/コンパクト）③ログイン後の初期表示（ホーム/前回の画面=localStorage復元）④デスクトップ通知（Notification API・未読増加時）⑤**通知の外部チャット転送**（notify() がユーザーの notify_webhook 設定を見て Incoming Webhook へ非同期POST。種類選択・テスト送信 POST /api/me/webhook-test。E2E検証済み）。メール表示・🔑パスワード/APIトークン導線も集約
 - [x] QAやり取り履歴＝A案スレッド（qa_comments テーブル・/api/qa/{qid}/comments CRUD。モーダル内タイムライン（投稿者・日時・削除は本人/管理者）・一覧に💬件数・回答担当へ通知。Excel出力「やり取り履歴」列に [MM/DD 名前] 本文 形式で整形、取込は既存整形行との差分だけを追加（冪等・[日付 名前] プレフィックス解析、無ければ質問者名义）。B案（枝番方式）は PROPOSALS.md 0章に将来候補として記録）
 - [x] QAに決定事項・備考カラムを追加（qa_items.decision/note、migrate()でALTER。一覧・編集モーダル・ビューExcel/全体Excel/アーカイブHTML・Excel取込すべて対応）
+- [x] 複数選択リストをクリックトグル式に（先行タスク・課題の関連タスク。Ctrl不要、もう一度クリックで解除。enableToggleSelect ヘルパー）
 - [x] ダッシュボードの集計から親タスクを除外（残タスク・簡易ボード・統計カード・円グラフ・週別負荷・期限リストすべて実作業タスクのみ。サーバー側 metrics（バーンダウン/リスク/工数）も同様）
 - [x] 管理画面・ユーザー設定表示中に左ペインのプロジェクトをクリックしたら、そのPJのビュー（前回のビューを復元、既定ボード）へ遷移
 - [x] **課題管理機能**（issues/issue_tasks/issue_comments テーブル・CRUD /api/projects/{pid}/issues-list・/api/issues/{iid}。📌課題タブ view='kadai'。ISS-001連番・重要度・方針/実行内容・担当（通知）・期限超過⚠・状態4種（解決/クローズで解決日自動）・コメントスレッド・**関連タスク多対多**。ボード/テーブルのタスクに**オープン課題数📌N**（クローズは除外、project_dataでカウント）・タスク詳細に関連課題（クリックで課題へ）。エクスポート: ビューExcel（課題管理表）+HTML+全体Excel課題シート+アーカイブHTML+JSON。**外部には既定で非公開**（external_visible_tabs既定にkadaiを含めない））

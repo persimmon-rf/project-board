@@ -2137,7 +2137,7 @@ function openKadaiModal(q = null) {
     <div class="form-row"><label>課題の内容・背景</label><textarea id="ism-desc" rows="3">${U.esc(q ? q.description || '' : '')}</textarea></div>
     <div class="form-row"><label>方針</label><textarea id="ism-policy" rows="3" placeholder="どう対処するかの方針">${U.esc(q ? q.policy || '' : '')}</textarea></div>
     <div class="form-row"><label>実行内容</label><textarea id="ism-action" rows="3" placeholder="実際に行う（行った）対応内容">${U.esc(q ? q.action_plan || '' : '')}</textarea></div>
-    <div class="form-row"><label>関連タスク（Ctrl+クリックで複数選択。ボード・テーブルのタスクに 📌件数 が表示されます）</label>
+    <div class="form-row"><label>関連タスク（クリックで選択／もう一度クリックで解除。ボード・テーブルのタスクに 📌件数 が表示されます）</label>
       <select id="ism-tasks" multiple size="5">
         ${buildWbs(State.tasks).map(t => `<option value="${t.id}"
           ${q && (q.tasks || []).some(x => x.id === t.id) ? 'selected' : ''}>${U.esc(taskLabel(t))}</option>`).join('')}
@@ -2153,6 +2153,7 @@ function openKadaiModal(q = null) {
       <button class="btn" data-close>キャンセル</button>
       <button class="btn primary" id="ism-save">${q ? '保存' : '追加'}</button>
     </div>`);
+  enableToggleSelect(document.getElementById('ism-tasks'));
   document.getElementById('ism-save').onclick = async () => {
     const v = (id) => document.getElementById(id).value;
     const title = v('ism-title').trim();

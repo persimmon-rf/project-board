@@ -112,7 +112,7 @@ function renderDetailPanel(d) {
             .map(x => `<option value="${x.id}" ${x.id === t.parent_id ? 'selected' : ''}>${U.esc(taskLabel(x))}</option>`).join('')}
         </select>
         <label>先行タスク</label>
-        <select id="dp-deps" multiple size="3" title="Ctrl+クリックで複数選択" ${dis('deps')}>
+        <select id="dp-deps" multiple size="3" title="クリックで選択／もう一度クリックで解除" ${dis('deps')}>
           ${buildWbs(State.tasks).filter(x => x.id !== t.id)
             .map(x => `<option value="${x.id}" ${(t.deps || []).includes(x.id) ? 'selected' : ''}>${U.esc(taskLabel(x))}</option>`).join('')}
         </select>
@@ -366,6 +366,7 @@ function bindDetailEvents(t, d) {
 
   $('dp-parent').onchange = (e) =>
     patchTask(tid, { parent_id: e.target.value ? Number(e.target.value) : null });
+  enableToggleSelect($('dp-deps'));
   $('dp-deps').onchange = (e) =>
     patchTask(tid, { deps: [...e.target.selectedOptions].map(o => Number(o.value)) });
 

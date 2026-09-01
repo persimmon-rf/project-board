@@ -184,6 +184,20 @@ function goTableFiltered(special) {
   render();
 }
 
+/* 複数選択リストを「クリックでトグル」式にする（Ctrl不要。もう一度クリックで解除） */
+function enableToggleSelect(sel) {
+  if (!sel || sel.disabled) return;
+  sel.querySelectorAll('option').forEach(opt => {
+    opt.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const top = sel.scrollTop;
+      opt.selected = !opt.selected;
+      setTimeout(() => { sel.scrollTop = top; });   // ブラウザの自動スクロールを抑止
+      sel.dispatchEvent(new Event('change'));
+    });
+  });
+}
+
 /* ---------------- toast ---------------- */
 let toastTimer;
 function toast(msg) {
